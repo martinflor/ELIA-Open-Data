@@ -47,6 +47,9 @@ def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     tmp = df.copy()
+    # Ensure index is DatetimeIndex
+    if not isinstance(tmp.index, pd.DatetimeIndex):
+        tmp.index = pd.to_datetime(tmp.index, errors='coerce')
     tmp["ts"] = tmp.index
     tmp["date"] = tmp["ts"].dt.date
     tmp["year"] = tmp["ts"].dt.year
@@ -73,35 +76,39 @@ def _iter_month_ranges(start_date: date, end_date: date) -> List[Tuple[date, dat
 
 
 def fetch_energy_with_progress(start_date: date, end_date: date) -> pd.DataFrame:
-    """Fetch energy data month-by-month with a visible progress bar."""
-    month_ranges = _iter_month_ranges(start_date, end_date)
+    """Fetch energy data using the chunked fetcher which handles month-by-month internally."""
     progress = st.progress(0, text="Fetching aFRR energy data...")
     status = st.empty()
-    frames: List[pd.DataFrame] = []
-    total = len(month_ranges)
-    for i, (m_start, m_end) in enumerate(month_ranges, start=1):
-        status.write(f"Energy: fetching {m_start} to {m_end} ({i}/{total})")
-        try:
-            df_part = elia.fetch_afrr_energy_price_range(m_start.strftime("%Y-%m-%d"), m_end.strftime("%Y-%m-%d"))
-            if df_part is not None and not df_part.empty:
-                frames.append(df_part)
-        except Exception as e:
-            status.warning(f"Energy fetch failed for {m_start}–{m_end}: {e}")
-        progress.progress(i / total, text=f"Fetching aFRR energy data... ({i}/{total})")
-    status.empty()
-    progress.empty()
-    if not frames:
+    
+    status.write(f"⏳ Fetching energy from {start_date} to {end_date}...")
+    progress.progress(0.5, text="Fetching aFRR energy data...")
+    
+    try:
+        # Use chunked fetcher which handles ods064/ods166 split and month-by-month internally
+        df = elia.fetch_afrr_energy_price_range_chunked(start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))
+        
+        if df is None or df.empty:
+            status.empty()
+            progress.empty()
+            st.warning("No energy data returned.")
+            return pd.DataFrame(columns=["afrrpriceup", "afrrpricedown"]).astype({"afrrpriceup": "float64", "afrrpricedown": "float64"})
+        
+        # Ensure required columns
+        for col in ["afrrpriceup", "afrrpricedown"]:
+            if col not in df.columns:
+                df[col] = pd.NA
+        
+        status.empty()
+        progress.empty()
+        
+        st.success(f"✅ Fetched {len(df)} rows | {df.index.min()} to {df.index.max()}")
+        return df
+        
+    except Exception as e:
+        status.empty()
+        progress.empty()
+        st.error(f"❌ Energy fetch failed: {str(e)}")
         return pd.DataFrame(columns=["afrrpriceup", "afrrpricedown"]).astype({"afrrpriceup": "float64", "afrrpricedown": "float64"})
-    df = pd.concat(frames, axis=0)
-    if not isinstance(df.index, pd.DatetimeIndex):
-        df.index = pd.to_datetime(df.index, errors="coerce")
-    df = df.sort_index()
-    df = df[~df.index.duplicated(keep="last")]
-    # Ensure required columns exist
-    for col in ["afrrpriceup", "afrrpricedown"]:
-        if col not in df.columns:
-            df[col] = pd.NA
-    return df
 
 
 def fetch_capacity_with_progress(start_date: date, end_date: date) -> pd.DataFrame:
@@ -109,6 +116,7 @@ def fetch_capacity_with_progress(start_date: date, end_date: date) -> pd.DataFra
     month_ranges = _iter_month_ranges(start_date, end_date)
     progress = st.progress(0, text="Fetching aFRR capacity data...")
     status = st.empty()
+    warning_container = st.container()
     frames: List[pd.DataFrame] = []
     total = len(month_ranges)
     for i, (m_start, m_end) in enumerate(month_ranges, start=1):
@@ -117,8 +125,13 @@ def fetch_capacity_with_progress(start_date: date, end_date: date) -> pd.DataFra
             part = elia.fetch_afrr_capacity_range(m_start.strftime("%Y-%m-%d"), m_end.strftime("%Y-%m-%d"))
             if part is not None and not part.empty:
                 frames.append(part)
+                status.write(f"✓ Capacity: {m_start} to {m_end} → {len(part)} rows")
+            else:
+                with warning_container:
+                    st.warning(f"No capacity data returned for {m_start}–{m_end}")
         except Exception as e:
-            status.warning(f"Capacity fetch failed for {m_start}–{m_end}: {e}")
+            with warning_container:
+                st.error(f"Capacity fetch failed for {m_start}–{m_end}: {e}")
         progress.progress(i / total, text=f"Fetching aFRR capacity data... ({i}/{total})")
     status.empty()
     progress.empty()
@@ -348,24 +361,35 @@ def main():
         start_date = date(default_end.year - 1, 1, 1)
         end_date = date(default_end.year - 1, 12, 31)
     else:
-        start_date, end_date = st.sidebar.date_input(
+        date_range = st.sidebar.date_input(
             "Date range",
             value=(default_start, default_end),
             min_value=date(2020, 1, 1),
             max_value=default_end,
         )
+        if isinstance(date_range, tuple) and len(date_range) == 2:
+            start_date, end_date = date_range
+        else:
+            # User selected only one date or cleared selection
+            start_date = default_start
+            end_date = default_end
 
     # Outlier settings (hidden defaults)
     iqr_k = 1.5
     outlier_view = "Together"
     exclude_outliers = False
 
+    # Display selected date range
+    st.sidebar.info(f"📅 Selected range:\n{start_date} to {end_date}")
+    
     st.sidebar.write("\n")
     fetch_button = st.sidebar.button("Fetch data", type="primary")
 
-    # Load from session if available
-    df_energy = st.session_state.get("df_energy")
-    cap_df_raw = st.session_state.get("cap_df_raw")
+    # Check if we're viewing cached data from a different range BEFORE fetching
+    cached_range = st.session_state.get("energy_range")
+    if not fetch_button and cached_range is not None:
+        if cached_range != (start_date, end_date):
+            st.sidebar.warning(f"⚠️ Showing cached data from:\n{cached_range[0]} to {cached_range[1]}\n\nClick 'Fetch data' to update.")
 
     if fetch_button:
         # Fetch energy first with progress
@@ -373,14 +397,14 @@ def main():
         st.session_state["df_energy"] = df_energy
         st.session_state["energy_range"] = (start_date, end_date)
 
-        # Fetch capacity with progress
-        try:
-            importlib.reload(elia)
-        except Exception:
-            pass
+        # Fetch capacity data with progress
         cap_df_raw = fetch_capacity_with_progress(start_date, end_date)
         st.session_state["cap_df_raw"] = cap_df_raw
         st.session_state["capacity_range"] = (start_date, end_date)
+
+    # Load from session AFTER potential fetch
+    df_energy = st.session_state.get("df_energy")
+    cap_df_raw = st.session_state.get("cap_df_raw")
 
     # Build tabs always, using session data when present
     tab1, tab2, tab3 = st.tabs(["aFRR Energy Prices", "aFRR Capacity Prices", "aFRR Capacity Volume"])
@@ -389,10 +413,13 @@ def main():
             if df_energy is None or df_energy.empty:
                 st.warning("No energy data returned for the selected range.")
             else:
-                st.caption("Data source: aFRR energy prices from ELIA Open Data — ods134 (historical) and ods166 (from 2024-05-01).")
+                st.caption("Data source: aFRR energy prices from ELIA Open Data — ods064 (historical) and ods166 (from 2024-05-01).")
+                # Debug: show date range of data
+                st.info(f"📅 Data covers: {df_energy.index.min()} to {df_energy.index.max()} (total: {len(df_energy)} rows)")
+                
                 # Confirmation of fetch
                 feat = add_time_features(df_energy)
-                counts_by_month = feat.groupby(["year", "month_name"]).size().reset_index(name="rows")
+                counts_by_month = feat.groupby(["year", "month_name"]).size().reset_index(name="rows").sort_values(["year", "month_name"])
                 total_rows = len(df_energy)
                 st.success(f"Fetched {total_rows} rows across {feat['year'].nunique()} year(s) and {feat['month'].nunique()} month(s).")
                 st.dataframe(counts_by_month)
@@ -419,9 +446,17 @@ def main():
                 total_count = int(len(df_energy))
                 st.info(f"Outlier filter (IQR k={iqr_k:.1f}): {outlier_count}/{total_count} points flagged as outliers.")
 
-                df_normal = df_energy[mask_normal]
-                df_outliers = df_energy[~mask_normal]
+                df_normal = df_energy[mask_normal].copy()
+                df_outliers = df_energy[~mask_normal].copy()
                 df_used = df_normal if exclude_outliers else df_energy
+                
+                # Ensure DatetimeIndex is preserved (handle timezone-aware indices)
+                if not isinstance(df_normal.index, pd.DatetimeIndex):
+                    df_normal.index = pd.to_datetime(df_normal.index, utc=True)
+                if not df_outliers.empty and not isinstance(df_outliers.index, pd.DatetimeIndex):
+                    df_outliers.index = pd.to_datetime(df_outliers.index, utc=True)
+                if not isinstance(df_used.index, pd.DatetimeIndex):
+                    df_used.index = pd.to_datetime(df_used.index, utc=True)
 
                 # Descriptive statistics
                 st.subheader("Descriptive Statistics")
@@ -526,6 +561,55 @@ def main():
                         fig.add_trace(go.Scatter(x=agg.index, y=agg[col], mode='lines', name=name, line_shape='hv', line=dict(color=color)))
                 fig.update_layout(title="aFRR capacity prices (accepted bids) - 4h step", yaxis_title="EUR/MWh")
                 st.plotly_chart(fig, use_container_width=True)
+
+                # Volume-weighted capacity price time series
+                st.subheader("Time series: volume-weighted capacity prices (4h step)")
+                st.caption("Volume-weighted average per 4h period: Σ(price × awarded_volume) / Σ(awarded_volume)")
+                
+                # Calculate volume-weighted prices per period (grouping by period_start index)
+                def volume_weighted_price(group, price_col, volume_col):
+                    """Calculate volume-weighted price for a group."""
+                    valid_mask = (group[volume_col].notna()) & (group[volume_col] > 0) & (group[price_col].notna())
+                    if valid_mask.sum() == 0:
+                        return pd.NA
+                    total_volume = group.loc[valid_mask, volume_col].sum()
+                    if total_volume == 0:
+                        return pd.NA
+                    weighted_sum = (group.loc[valid_mask, price_col] * group.loc[valid_mask, volume_col]).sum()
+                    return weighted_sum / total_volume
+                
+                vw_agg = cap_df.groupby(level=0).apply(
+                    lambda g: pd.Series({
+                        'vw_price_up': volume_weighted_price(g, 'priceupmwh', 'afrrawardedvolumeupmw'),
+                        'vw_price_down': volume_weighted_price(g, 'pricedownmwh', 'afrrawardedvolumedownmw')
+                    })
+                ).sort_index()
+                
+                st.dataframe(vw_agg.head(200))
+                
+                # Plot volume-weighted prices as step function
+                fig_vw = go.Figure()
+                fig_vw.add_trace(go.Scatter(
+                    x=vw_agg.index, 
+                    y=vw_agg['vw_price_up'], 
+                    mode='lines',
+                    name='Volume-weighted UP',
+                    line_shape='hv',
+                    line=dict(color='#d62728')
+                ))
+                fig_vw.add_trace(go.Scatter(
+                    x=vw_agg.index, 
+                    y=vw_agg['vw_price_down'], 
+                    mode='lines',
+                    name='Volume-weighted DOWN',
+                    line_shape='hv',
+                    line=dict(color='#1f77b4')
+                ))
+                fig_vw.update_layout(
+                    title="Volume-weighted capacity prices (4h step)",
+                    yaxis_title="EUR/MW/h (volume-weighted)"
+                )
+                st.plotly_chart(fig_vw, use_container_width=True)
 
                 # Download
                 st.download_button(
