@@ -58,6 +58,75 @@ def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
     return tmp
 
 
+def _iter_month_ranges(start_date: date, end_date: date) -> List[Tuple[date, date]]:
+    """Yield (month_start, month_end) tuples covering [start_date, end_date]."""
+    ranges: List[Tuple[date, date]] = []
+    cursor = date(start_date.year, start_date.month, 1)
+    while cursor <= end_date:
+        # month end: next month first day minus one day
+        next_month = (cursor.replace(day=28) + timedelta(days=4)).replace(day=1)
+        month_end = min(next_month - timedelta(days=1), end_date)
+        month_start = max(cursor, start_date)
+        ranges.append((month_start, month_end))
+        cursor = next_month
+    return ranges
+
+
+def fetch_energy_with_progress(start_date: date, end_date: date) -> pd.DataFrame:
+    """Fetch energy data month-by-month with a visible progress bar."""
+    month_ranges = _iter_month_ranges(start_date, end_date)
+    progress = st.progress(0, text="Fetching aFRR energy data...")
+    status = st.empty()
+    frames: List[pd.DataFrame] = []
+    total = len(month_ranges)
+    for i, (m_start, m_end) in enumerate(month_ranges, start=1):
+        status.write(f"Energy: fetching {m_start} to {m_end} ({i}/{total})")
+        try:
+            df_part = elia.fetch_afrr_energy_price_range(m_start.strftime("%Y-%m-%d"), m_end.strftime("%Y-%m-%d"))
+            if df_part is not None and not df_part.empty:
+                frames.append(df_part)
+        except Exception as e:
+            status.warning(f"Energy fetch failed for {m_start}–{m_end}: {e}")
+        progress.progress(i / total, text=f"Fetching aFRR energy data... ({i}/{total})")
+    status.empty()
+    progress.empty()
+    if not frames:
+        return pd.DataFrame(columns=["afrrpriceup", "afrrpricedown"]).astype({"afrrpriceup": "float64", "afrrpricedown": "float64"})
+    df = pd.concat(frames, axis=0)
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df.index = pd.to_datetime(df.index, errors="coerce")
+    df = df.sort_index()
+    df = df[~df.index.duplicated(keep="last")]
+    # Ensure required columns exist
+    for col in ["afrrpriceup", "afrrpricedown"]:
+        if col not in df.columns:
+            df[col] = pd.NA
+    return df
+
+
+def fetch_capacity_with_progress(start_date: date, end_date: date) -> pd.DataFrame:
+    """Fetch capacity data month-by-month with a visible progress bar."""
+    month_ranges = _iter_month_ranges(start_date, end_date)
+    progress = st.progress(0, text="Fetching aFRR capacity data...")
+    status = st.empty()
+    frames: List[pd.DataFrame] = []
+    total = len(month_ranges)
+    for i, (m_start, m_end) in enumerate(month_ranges, start=1):
+        status.write(f"Capacity: fetching {m_start} to {m_end} ({i}/{total})")
+        try:
+            part = elia.fetch_afrr_capacity_range(m_start.strftime("%Y-%m-%d"), m_end.strftime("%Y-%m-%d"))
+            if part is not None and not part.empty:
+                frames.append(part)
+        except Exception as e:
+            status.warning(f"Capacity fetch failed for {m_start}–{m_end}: {e}")
+        progress.progress(i / total, text=f"Fetching aFRR capacity data... ({i}/{total})")
+    status.empty()
+    progress.empty()
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, axis=0).reset_index(drop=True)
+
+
 def build_capacity_periods(df: pd.DataFrame) -> pd.DataFrame:
     """Construct 4-hour period start/end timestamps from deliverydate and capacitybiddeliveryperiod.
 
@@ -299,21 +368,19 @@ def main():
     cap_df_raw = st.session_state.get("cap_df_raw")
 
     if fetch_button:
-        # Fetch energy first
-        with st.spinner("Loading energy data from ELIA..."):
-            df_energy = load_afrr_prices_for_range(start_date, end_date)
-            st.session_state["df_energy"] = df_energy
-            st.session_state["energy_range"] = (start_date, end_date)
-        
-        # Fetch capacity after energy is ready
-        with st.spinner("Loading capacity data from ELIA..."):
-            try:
-                importlib.reload(elia)
-            except Exception:
-                pass
-            cap_df_raw = elia.fetch_afrr_capacity_range_chunked(start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))
-            st.session_state["cap_df_raw"] = cap_df_raw
-            st.session_state["capacity_range"] = (start_date, end_date)
+        # Fetch energy first with progress
+        df_energy = fetch_energy_with_progress(start_date, end_date)
+        st.session_state["df_energy"] = df_energy
+        st.session_state["energy_range"] = (start_date, end_date)
+
+        # Fetch capacity with progress
+        try:
+            importlib.reload(elia)
+        except Exception:
+            pass
+        cap_df_raw = fetch_capacity_with_progress(start_date, end_date)
+        st.session_state["cap_df_raw"] = cap_df_raw
+        st.session_state["capacity_range"] = (start_date, end_date)
 
     # Build tabs always, using session data when present
     tab1, tab2, tab3 = st.tabs(["aFRR Energy Prices", "aFRR Capacity Prices", "aFRR Capacity Volume"])
