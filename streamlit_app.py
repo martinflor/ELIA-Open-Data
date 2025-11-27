@@ -140,6 +140,43 @@ def fetch_capacity_with_progress(start_date: date, end_date: date) -> pd.DataFra
     return pd.concat(frames, axis=0).reset_index(drop=True)
 
 
+def fetch_pv_with_progress(start_date: date, end_date: date) -> pd.DataFrame:
+    """Fetch photovoltaic production data using the chunked fetcher."""
+    progress = st.progress(0, text="Fetching photovoltaic production data...")
+    status = st.empty()
+    
+    status.write(f"⏳ Fetching PV data from {start_date} to {end_date}...")
+    progress.progress(0.5, text="Fetching photovoltaic production data...")
+    
+    try:
+        # Ensure we have latest version if file changed during dev session
+        try:
+            importlib.reload(elia)
+        except Exception:
+            pass
+        
+        # Use chunked fetcher to handle month-by-month internally
+        df = elia.fetch_photovoltaic_production_range_chunked(start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))
+        
+        if df is None or df.empty:
+            status.empty()
+            progress.empty()
+            st.warning("No photovoltaic production data returned.")
+            return pd.DataFrame()
+        
+        status.empty()
+        progress.empty()
+        
+        st.success(f"✅ Fetched {len(df)} rows | {df.index.min()} to {df.index.max()}")
+        return df
+        
+    except Exception as e:
+        status.empty()
+        progress.empty()
+        st.error(f"❌ PV fetch failed: {str(e)}")
+        return pd.DataFrame()
+
+
 def build_capacity_periods(df: pd.DataFrame) -> pd.DataFrame:
     """Construct 4-hour period start/end timestamps from deliverydate and capacitybiddeliveryperiod.
 
@@ -250,9 +287,66 @@ def render_distributions(df: pd.DataFrame):
     if df.empty:
         st.info("No data to plot.")
         return
-    melted = df.melt(value_vars=["afrrpriceup", "afrrpricedown"], var_name="series", value_name="price")
-    fig = px.histogram(melted, x="price", color="series", nbins=100, barmode="overlay", opacity=0.6, title="Distribution of aFRR Prices")
+    
+    # Add time features to get year information
+    feat = add_time_features(df)
+    unique_years = sorted(feat['year'].unique())
+    n_years = len(unique_years)
+    
+    # Overall distribution (all years combined)
+    st.markdown("#### Overall Distribution (All Years)")
+    melted = feat.melt(value_vars=["afrrpriceup", "afrrpricedown"], var_name="series", value_name="price")
+    fig = px.histogram(melted, x="price", color="series", nbins=100, barmode="overlay", opacity=0.6, title="Distribution of aFRR Prices (All Data)")
     st.plotly_chart(fig, use_container_width=True)
+    
+    # If multiple years, show year-by-year distributions
+    if n_years > 1:
+        st.markdown("#### Distribution by Year")
+        st.caption(f"Comparing distributions across {n_years} years: {', '.join(map(str, unique_years))}")
+        
+        # Prepare data with year information
+        melted_with_year = feat.melt(
+            id_vars=['year'], 
+            value_vars=["afrrpriceup", "afrrpricedown"], 
+            var_name="series", 
+            value_name="price"
+        )
+        melted_with_year['year_series'] = melted_with_year['year'].astype(str) + ' - ' + melted_with_year['series']
+        
+        # Create histogram with year and series as color
+        fig_years = px.histogram(
+            melted_with_year, 
+            x="price", 
+            color="year_series", 
+            nbins=100, 
+            barmode="overlay", 
+            opacity=0.5, 
+            title=f"Distribution of aFRR Prices by Year ({min(unique_years)}-{max(unique_years)})",
+            labels={"year_series": "Year & Series", "price": "Price (EUR/MWh)"}
+        )
+        st.plotly_chart(fig_years, use_container_width=True)
+        
+        # Also create faceted plots for clearer comparison
+        st.markdown("#### Faceted View by Year")
+        fig_facet = px.histogram(
+            melted_with_year, 
+            x="price", 
+            color="series",
+            facet_row="year",
+            nbins=80, 
+            barmode="overlay", 
+            opacity=0.6,
+            title="Distribution of aFRR Prices - Faceted by Year",
+            labels={"price": "Price (EUR/MWh)", "series": "Series"},
+            height=300 * n_years  # Dynamic height based on number of years
+        )
+        fig_facet.update_yaxes(matches=None)  # Allow independent y-axes for each facet
+        st.plotly_chart(fig_facet, use_container_width=True)
+        
+        # Statistical comparison table
+        st.markdown("#### Year-by-Year Statistics")
+        stats_by_year = feat.groupby('year')[['afrrpriceup', 'afrrpricedown']].describe().round(2)
+        st.dataframe(stats_by_year)
 
 
 def render_heatmap(df: pd.DataFrame):
@@ -292,9 +386,9 @@ def render_aggregations(df: pd.DataFrame):
 
 
 def main():
-    st.set_page_config(page_title="ELIA aFRR Price Explorer", layout="wide")
-    st.title("ELIA aFRR Price Explorer")
-    st.caption("Interactive exploration of aFRR energy and capacity prices from ELIA Open Data.")
+    st.set_page_config(page_title="ELIA Open Data Explorer", layout="wide")
+    st.title("ELIA Open Data Explorer")
+    st.caption("Interactive exploration of aFRR energy and capacity prices, and photovoltaic production from ELIA Open Data.")
 
     # Sidebar controls
     st.sidebar.header("Controls")
@@ -383,7 +477,9 @@ def main():
     st.sidebar.info(f"📅 Selected range:\n{start_date} to {end_date}")
     
     st.sidebar.write("\n")
-    fetch_button = st.sidebar.button("Fetch data", type="primary")
+    st.sidebar.subheader("Fetch Data")
+    fetch_button = st.sidebar.button("Fetch aFRR data", type="primary")
+    fetch_pv_button = st.sidebar.button("Fetch PV data", type="secondary")
 
     # Check if we're viewing cached data from a different range BEFORE fetching
     cached_range = st.session_state.get("energy_range")
@@ -402,18 +498,25 @@ def main():
         st.session_state["cap_df_raw"] = cap_df_raw
         st.session_state["capacity_range"] = (start_date, end_date)
 
+    if fetch_pv_button:
+        # Fetch PV data with progress
+        df_pv = fetch_pv_with_progress(start_date, end_date)
+        st.session_state["df_pv"] = df_pv
+        st.session_state["pv_range"] = (start_date, end_date)
+
     # Load from session AFTER potential fetch
     df_energy = st.session_state.get("df_energy")
     cap_df_raw = st.session_state.get("cap_df_raw")
+    df_pv = st.session_state.get("df_pv")
 
     # Build tabs always, using session data when present
-    tab1, tab2, tab3 = st.tabs(["aFRR Energy Prices", "aFRR Capacity Prices", "aFRR Capacity Volume"])
+    tab1, tab2, tab3, tab4 = st.tabs(["aFRR Energy Prices", "aFRR Capacity Prices", "aFRR Capacity Volume", "Photovoltaic Production"])
 
     with tab1:
             if df_energy is None or df_energy.empty:
                 st.warning("No energy data returned for the selected range.")
             else:
-                st.caption("Data source: aFRR energy prices from ELIA Open Data — ods064 (historical) and ods166 (from 2024-05-01).")
+                st.caption("Data source: aFRR energy prices from ELIA Open Data — ods064 (until 2024-05-21) and ods166 (from 2024-05-22).")
                 # Debug: show date range of data
                 st.info(f"📅 Data covers: {df_energy.index.min()} to {df_energy.index.max()} (total: {len(df_energy)} rows)")
                 
@@ -774,6 +877,194 @@ def main():
                 file_name=f"afrr_capacity_awarded_volumes_{start_date}_{end_date}.csv",
                 mime="text/csv",
             )
+
+    with tab4:
+        if df_pv is None or df_pv.empty:
+            st.warning("No photovoltaic production data found. Click 'Fetch PV data' to load data.")
+        else:
+            st.caption("Data source: Photovoltaic power production estimation and forecast on Belgian grid — ods032.")
+            st.info(f"📅 Data covers: {df_pv.index.min()} to {df_pv.index.max()} (total: {len(df_pv)} rows)")
+            
+            # Region selector
+            st.subheader("Region Selection")
+            available_regions = sorted(df_pv['region'].unique()) if 'region' in df_pv.columns else []
+            if not available_regions:
+                st.warning("No region data available.")
+            else:
+                selected_region = st.selectbox("Select Region", available_regions)
+                
+                # Filter data by selected region
+                df_region = df_pv[df_pv['region'] == selected_region].copy()
+                
+                if df_region.empty:
+                    st.warning(f"No data for region {selected_region}.")
+                else:
+                    # Ensure we have the required columns
+                    required_cols = ['measured', 'monitoredcapacity', 'loadfactor']
+                    missing_cols = [col for col in required_cols if col not in df_region.columns]
+                    if missing_cols:
+                        st.error(f"Missing required columns: {missing_cols}")
+                    else:
+                        st.success(f"Displaying {len(df_region)} rows for {selected_region}")
+                        
+                        # Ensure index is DatetimeIndex (handle tz-aware values)
+                        if not isinstance(df_region.index, pd.DatetimeIndex):
+                            df_region.index = pd.to_datetime(df_region.index, utc=True)
+                        
+                        # Add time features for aggregations
+                        df_region['year'] = df_region.index.year
+                        df_region['month'] = df_region.index.month
+                        df_region['month_name'] = df_region.index.month_name()
+                        df_region['date'] = df_region.index.date
+                        
+                        # Plot 1: Measured values, monitored capacity, and load factor
+                        st.subheader("Production Metrics Over Time")
+                        
+                        # Create separate subplots for better visualization
+                        fig1 = go.Figure()
+                        fig1.add_trace(go.Scatter(
+                            x=df_region.index, 
+                            y=df_region['measured'], 
+                            mode='lines', 
+                            name='Measured Production (MW)',
+                            line=dict(color='#1f77b4')
+                        ))
+                        fig1.add_trace(go.Scatter(
+                            x=df_region.index, 
+                            y=df_region['monitoredcapacity'], 
+                            mode='lines', 
+                            name='Monitored Capacity (MW)',
+                            line=dict(color='#ff7f0e', dash='dash')
+                        ))
+                        fig1.update_layout(
+                            title=f"PV Production and Capacity - {selected_region}",
+                            xaxis_title="Time",
+                            yaxis_title="Power (MW)",
+                            hovermode='x unified'
+                        )
+                        st.plotly_chart(fig1, use_container_width=True)
+                        
+                        # Load factor plot
+                        fig2 = go.Figure()
+                        fig2.add_trace(go.Scatter(
+                            x=df_region.index, 
+                            y=df_region['loadfactor'], 
+                            mode='lines', 
+                            name='Load Factor (%)',
+                            line=dict(color='#2ca02c'),
+                            fill='tozeroy'
+                        ))
+                        fig2.update_layout(
+                            title=f"Load Factor - {selected_region}",
+                            xaxis_title="Time",
+                            yaxis_title="Load Factor (%)",
+                            hovermode='x unified'
+                        )
+                        st.plotly_chart(fig2, use_container_width=True)
+                        
+                        # Plot 2: Energy (trapezoidal approximation)
+                        st.subheader("Cumulative Energy Production")
+                        st.caption("Energy calculated using trapezoidal integration (assumes 15-minute intervals)")
+                        
+                        # Calculate energy using trapezoidal rule
+                        # Energy = ∫ Power dt, with Power in MW and time in hours
+                        # For 15-minute intervals, dt = 0.25 hours
+                        df_region_sorted = df_region.sort_index()
+                        
+                        # Calculate time differences in hours
+                        time_diffs = df_region_sorted.index.to_series().diff().dt.total_seconds() / 3600
+                        # For the first point, assume same interval as the second
+                        time_diffs.iloc[0] = time_diffs.iloc[1] if len(time_diffs) > 1 else 0.25
+                        
+                        # Trapezoidal rule: E_i = (P_i + P_{i-1})/2 * dt_i
+                        power_avg = (df_region_sorted['measured'] + df_region_sorted['measured'].shift(1)) / 2
+                        power_avg.iloc[0] = df_region_sorted['measured'].iloc[0]  # First point
+                        
+                        energy_increments = power_avg * time_diffs
+                        cumulative_energy = energy_increments.cumsum()
+                        
+                        df_region_sorted['cumulative_energy_mwh'] = cumulative_energy
+                        df_region_sorted['energy_increment_mwh'] = energy_increments
+                        
+                        fig3 = go.Figure()
+                        fig3.add_trace(go.Scatter(
+                            x=df_region_sorted.index, 
+                            y=df_region_sorted['cumulative_energy_mwh'], 
+                            mode='lines', 
+                            name='Cumulative Energy (MWh)',
+                            line=dict(color='#d62728'),
+                            fill='tozeroy'
+                        ))
+                        fig3.update_layout(
+                            title=f"Cumulative Energy Production - {selected_region}",
+                            xaxis_title="Time",
+                            yaxis_title="Cumulative Energy (MWh)",
+                            hovermode='x unified'
+                        )
+                        st.plotly_chart(fig3, use_container_width=True)
+                        
+                        # Plot 3: kWh per month per kWp
+                        st.subheader("Monthly Production per kWp")
+                        st.caption("Energy produced per month normalized by monitored capacity (kWh/kWp)")
+                        
+                        # Group by year and month, sum energy increments
+                        monthly_energy = df_region_sorted.groupby(['year', 'month', 'month_name']).agg({
+                            'energy_increment_mwh': 'sum',
+                            'monitoredcapacity': 'mean'  # average capacity for the month
+                        }).reset_index()
+                        
+                        # Convert MWh to kWh and MW to kW
+                        monthly_energy['energy_kwh'] = monthly_energy['energy_increment_mwh'] * 1000
+                        monthly_energy['capacity_kw'] = monthly_energy['monitoredcapacity'] * 1000
+                        
+                        # Calculate kWh per kWp (kWp = kW peak)
+                        monthly_energy['kwh_per_kwp'] = monthly_energy['energy_kwh'] / monthly_energy['capacity_kw']
+                        
+                        # Create year-month label for plotting
+                        monthly_energy['year_month'] = monthly_energy['year'].astype(str) + '-' + monthly_energy['month_name']
+                        
+                        # Sort by year and month
+                        monthly_energy = monthly_energy.sort_values(['year', 'month'])
+                        
+                        fig4 = px.bar(
+                            monthly_energy, 
+                            x='year_month', 
+                            y='kwh_per_kwp',
+                            title=f"Monthly Energy Production per kWp - {selected_region}",
+                            labels={'year_month': 'Month', 'kwh_per_kwp': 'kWh/kWp'},
+                            color='kwh_per_kwp',
+                            color_continuous_scale='Viridis'
+                        )
+                        fig4.update_layout(xaxis_tickangle=-45)
+                        st.plotly_chart(fig4, use_container_width=True)
+                        
+                        # Display monthly statistics table
+                        st.subheader("Monthly Statistics")
+                        display_cols = ['year_month', 'energy_kwh', 'capacity_kw', 'kwh_per_kwp']
+                        st.dataframe(monthly_energy[display_cols].style.format({
+                            'energy_kwh': '{:.2f}',
+                            'capacity_kw': '{:.2f}',
+                            'kwh_per_kwp': '{:.3f}'
+                        }))
+                        
+                        # Downloads
+                        st.subheader("Downloads")
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.download_button(
+                                label="Download raw PV data (CSV)",
+                                data=df_region.to_csv(index=True).encode("utf-8"),
+                                file_name=f"pv_production_{selected_region}_{start_date}_{end_date}.csv",
+                                mime="text/csv",
+                            )
+                        with col2:
+                            st.download_button(
+                                label="Download monthly statistics (CSV)",
+                                data=monthly_energy.to_csv(index=False).encode("utf-8"),
+                                file_name=f"pv_monthly_stats_{selected_region}_{start_date}_{end_date}.csv",
+                                mime="text/csv",
+                            )
+
 if __name__ == "__main__":
     main()
 
