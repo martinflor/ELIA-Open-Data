@@ -196,16 +196,16 @@ def fetch_balancing_energy_prices(date):
 def fetch_afrr_energy_price(date):
     logger.info(f"Starting fetch_afrr_energy_price for {date}")
     try:
-        # Check if date is before May 2024
+        # Check if date is before May 22, 2024 (ods064 used until May 21 inclusive)
         date_obj = datetime.strptime(date, "%Y-%m-%d")
-        may_2024 = datetime(2024, 5, 1)
+        may_2024 = datetime(2024, 5, 22)
         
         if date_obj < may_2024:
-            logger.info(f"Using historical dataset (ods134) for {date}")
+            logger.info(f"Using historical dataset (ods064) for {date} (before 2024-05-22)")
             data = fetch_day_data(
-                dataset='ods134',
+                dataset='ods064',
                 date=date,
-                select_fields='datetime,marginalincrementalprice,marginaldecrementalprice,imbalanceprice,qualitystatus',
+                select_fields='datetime,marginalincrementalprice,marginaldecrementalprice,netregulationvolume,qualitystatus',
                 time_field='datetime'
             )
             # Rename columns to match the expected format
@@ -216,7 +216,7 @@ def fetch_afrr_energy_price(date):
                     'marginaldecrementalprice': 'afrrpricedown'
                 })
         else:
-            logger.info(f"Using future dataset (ods166) for {date}")
+            logger.info(f"Using new dataset (ods166) for {date} (from 2024-05-22)")
             data = fetch_day_data(
                 dataset='ods166',
                 date=date,
@@ -248,56 +248,77 @@ def fetch_afrr_energy_price(date):
 def fetch_afrr_energy_price_range(start_date, end_date):
     """Fetch aFRR energy prices for a date range [start_date, end_date] inclusive.
 
-    Handles split between historical dataset ods134 (before 2024-05-01) and ods166 (from 2024-05-01).
+    Handles split between historical dataset ods064 (until 2024-05-21) and ods166 (from 2024-05-22).
     Returns a pandas DataFrame indexed by datetime with columns including 'afrrpriceup' and 'afrrpricedown'.
     """
     try:
         start_dt = datetime.strptime(start_date, "%Y-%m-%d")
         end_dt = datetime.strptime(end_date, "%Y-%m-%d")
-        may_2024 = datetime(2024, 5, 1)
+        may_2024 = datetime(2024, 5, 22)
 
         frames = []
 
-        # Historical part (before 2024-05-01)
+        # Historical part (before 2024-05-22, i.e., until 2024-05-21 inclusive)
         if start_dt < may_2024:
             hist_start = start_dt
             hist_end = min(end_dt, may_2024 - timedelta(days=1))
-            data_hist = fetch_range_data(
-                dataset='ods134',
-                start_date=hist_start.strftime('%Y-%m-%d'),
-                end_date=hist_end.strftime('%Y-%m-%d'),
-                select_fields='datetime,marginalincrementalprice,marginaldecrementalprice,imbalanceprice,qualitystatus',
-                time_field='datetime'
-            )
-            df_hist = filter_data(data_hist, index_column='datetime')
-            if not df_hist.empty:
-                df_hist = df_hist.rename(columns={
-                    'marginalincrementalprice': 'afrrpriceup',
-                    'marginaldecrementalprice': 'afrrpricedown'
-                })
-                frames.append(df_hist)
+            logger.info(f"Fetching historical data from ods064 (until 2024-05-21): {hist_start.strftime('%Y-%m-%d')} to {hist_end.strftime('%Y-%m-%d')}")
+            try:
+                data_hist = fetch_range_data(
+                    dataset='ods064',
+                    start_date=hist_start.strftime('%Y-%m-%d'),
+                    end_date=hist_end.strftime('%Y-%m-%d'),
+                    select_fields='datetime,marginalincrementalprice,marginaldecrementalprice,netregulationvolume,qualitystatus',
+                    time_field='datetime'
+                )
+                df_hist = filter_data(data_hist, index_column='datetime')
+                logger.info(f"Historical data fetched: {len(df_hist)} rows")
+                if not df_hist.empty:
+                    # Rename columns to match expected format
+                    df_hist = df_hist.rename(columns={
+                        'marginalincrementalprice': 'afrrpriceup',
+                        'marginaldecrementalprice': 'afrrpricedown'
+                    })
+                    frames.append(df_hist)
+                else:
+                    logger.warning(f"No historical data returned from ods064 for {hist_start.date()} to {hist_end.date()}")
+            except Exception as e:
+                logger.error(f"Failed to fetch historical data from ods064: {str(e)}")
+                # Don't raise, continue to try new dataset
 
-        # New dataset (from 2024-05-01)
+        # New dataset (from 2024-05-22)
         if end_dt >= may_2024:
             fut_start = max(start_dt, may_2024)
             fut_end = end_dt
-            data_new = fetch_range_data(
-                dataset='ods166',
-                start_date=fut_start.strftime('%Y-%m-%d'),
-                end_date=fut_end.strftime('%Y-%m-%d'),
-                select_fields='datetime,afrrpriceup,marginalincrementalprice,floorprice,afrrpricedown,marginaldecrementalprice,cap,qualitystatus',
-                time_field='datetime'
-            )
-            df_new = filter_data(data_new, index_column='datetime')
-            if not df_new.empty:
-                frames.append(df_new)
+            logger.info(f"Fetching new data from ods166 (from 2024-05-22): {fut_start.strftime('%Y-%m-%d')} to {fut_end.strftime('%Y-%m-%d')}")
+            try:
+                data_new = fetch_range_data(
+                    dataset='ods166',
+                    start_date=fut_start.strftime('%Y-%m-%d'),
+                    end_date=fut_end.strftime('%Y-%m-%d'),
+                    select_fields='datetime,afrrpriceup,marginalincrementalprice,floorprice,afrrpricedown,marginaldecrementalprice,cap,qualitystatus',
+                    time_field='datetime'
+                )
+                df_new = filter_data(data_new, index_column='datetime')
+                logger.info(f"New data fetched: {len(df_new)} rows")
+                if not df_new.empty:
+                    frames.append(df_new)
+                else:
+                    logger.warning(f"No new data returned from ods166 for {fut_start.date()} to {fut_end.date()}")
+            except Exception as e:
+                logger.error(f"Failed to fetch new data from ods166: {str(e)}")
+                # Don't raise if we have some data already
+                if not frames:
+                    raise
 
         if not frames:
+            logger.warning(f"No data frames collected for range {start_date} to {end_date}")
             return pd.DataFrame()
 
         df = pd.concat(frames, axis=0)
         df = df[~df.index.duplicated(keep='last')]
         df = df.sort_index()
+        logger.info(f"Final combined data: {len(df)} rows from {df.index.min()} to {df.index.max()}")
         return df
     except Exception as e:
         logger.error(f"Failed to fetch energy data for range {start_date} to {end_date}: {str(e)}")
@@ -388,4 +409,70 @@ def fetch_afrr_capacity_range_chunked(start_date, end_date):
         return pd.DataFrame()
     df = pd.concat(frames, axis=0)
     return df.reset_index(drop=True)
+
+def fetch_photovoltaic_production(date):
+    """Fetch photovoltaic power production data for a single day from ELIA dataset ods032.
+    
+    Returns DataFrame with datetime index and columns: region, measured, monitoredcapacity, loadfactor
+    """
+    try:
+        data = fetch_day_data(
+            dataset='ods032',
+            date=date,
+            select_fields='datetime,resolutioncode,region,measured,monitoredcapacity,loadfactor',
+            time_field='datetime'
+        )
+        return filter_data(data, index_column='datetime')
+    except Exception as e:
+        logger.error(f"Error fetching photovoltaic production for {date}: {str(e)}")
+        return pd.DataFrame()
+
+def fetch_photovoltaic_production_range(start_date, end_date):
+    """Fetch photovoltaic power production data for a date range from ELIA dataset ods032.
+    
+    Returns DataFrame with datetime index and columns: region, measured, monitoredcapacity, loadfactor
+    """
+    try:
+        data = fetch_range_data(
+            dataset='ods032',
+            start_date=start_date,
+            end_date=end_date,
+            select_fields='datetime,resolutioncode,region,measured,monitoredcapacity,loadfactor',
+            time_field='datetime'
+        )
+        return filter_data(data, index_column='datetime')
+    except Exception as e:
+        logger.error(f"Error fetching photovoltaic production for range {start_date} to {end_date}: {str(e)}")
+        return pd.DataFrame()
+
+def fetch_photovoltaic_production_range_chunked(start_date, end_date):
+    """Fetch photovoltaic production by iterating month-sized chunks to avoid API result size/offset limits.
+    
+    Splits [start_date, end_date] into calendar months and merges results.
+    """
+    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+
+    frames = []
+    cursor = _month_start(start_dt)
+    final_end = end_dt
+
+    while cursor <= final_end:
+        chunk_start = max(cursor, start_dt)
+        chunk_end = min(_next_month(cursor) - timedelta(days=1), final_end)
+        try:
+            df_chunk = fetch_photovoltaic_production_range(chunk_start.strftime('%Y-%m-%d'), chunk_end.strftime('%Y-%m-%d'))
+            if not df_chunk.empty:
+                frames.append(df_chunk)
+        except Exception as e:
+            logger.error(f"PV chunk fetch failed for {chunk_start.date()} to {chunk_end.date()}: {e}")
+        cursor = _next_month(cursor)
+
+    if not frames:
+        return pd.DataFrame()
+
+    df = pd.concat(frames, axis=0)
+    df = df[~df.index.duplicated(keep='last')]
+    df = df.sort_index()
+    return df
 
