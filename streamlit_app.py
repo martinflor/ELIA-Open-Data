@@ -324,9 +324,66 @@ def render_distributions(df: pd.DataFrame):
     if df.empty:
         st.info("No data to plot.")
         return
-    melted = df.melt(value_vars=["afrrpriceup", "afrrpricedown"], var_name="series", value_name="price")
-    fig = px.histogram(melted, x="price", color="series", nbins=100, barmode="overlay", opacity=0.6, title="Distribution of aFRR Prices")
+    
+    # Add time features to get year information
+    feat = add_time_features(df)
+    unique_years = sorted(feat['year'].unique())
+    n_years = len(unique_years)
+    
+    # Overall distribution (all years combined)
+    st.markdown("#### Overall Distribution (All Years)")
+    melted = feat.melt(value_vars=["afrrpriceup", "afrrpricedown"], var_name="series", value_name="price")
+    fig = px.histogram(melted, x="price", color="series", nbins=100, barmode="overlay", opacity=0.6, title="Distribution of aFRR Prices (All Data)")
     st.plotly_chart(fig, use_container_width=True)
+    
+    # If multiple years, show year-by-year distributions
+    if n_years > 1:
+        st.markdown("#### Distribution by Year")
+        st.caption(f"Comparing distributions across {n_years} years: {', '.join(map(str, unique_years))}")
+        
+        # Prepare data with year information
+        melted_with_year = feat.melt(
+            id_vars=['year'], 
+            value_vars=["afrrpriceup", "afrrpricedown"], 
+            var_name="series", 
+            value_name="price"
+        )
+        melted_with_year['year_series'] = melted_with_year['year'].astype(str) + ' - ' + melted_with_year['series']
+        
+        # Create histogram with year and series as color
+        fig_years = px.histogram(
+            melted_with_year, 
+            x="price", 
+            color="year_series", 
+            nbins=100, 
+            barmode="overlay", 
+            opacity=0.5, 
+            title=f"Distribution of aFRR Prices by Year ({min(unique_years)}-{max(unique_years)})",
+            labels={"year_series": "Year & Series", "price": "Price (EUR/MWh)"}
+        )
+        st.plotly_chart(fig_years, use_container_width=True)
+        
+        # Also create faceted plots for clearer comparison
+        st.markdown("#### Faceted View by Year")
+        fig_facet = px.histogram(
+            melted_with_year, 
+            x="price", 
+            color="series",
+            facet_row="year",
+            nbins=80, 
+            barmode="overlay", 
+            opacity=0.6,
+            title="Distribution of aFRR Prices - Faceted by Year",
+            labels={"price": "Price (EUR/MWh)", "series": "Series"},
+            height=300 * n_years  # Dynamic height based on number of years
+        )
+        fig_facet.update_yaxes(matches=None)  # Allow independent y-axes for each facet
+        st.plotly_chart(fig_facet, use_container_width=True)
+        
+        # Statistical comparison table
+        st.markdown("#### Year-by-Year Statistics")
+        stats_by_year = feat.groupby('year')[['afrrpriceup', 'afrrpricedown']].describe().round(2)
+        st.dataframe(stats_by_year)
 
 
 def render_heatmap(df: pd.DataFrame):
@@ -504,7 +561,7 @@ def main():
             if df_energy is None or df_energy.empty:
                 st.warning("No energy data returned for the selected range.")
             else:
-                st.caption("Data source: aFRR energy prices from ELIA Open Data — ods064 (historical) and ods166 (from 2024-05-01).")
+                st.caption("Data source: aFRR energy prices from ELIA Open Data — ods064 (until 2024-05-21) and ods166 (from 2024-05-22).")
                 # Debug: show date range of data
                 st.info(f"📅 Data covers: {df_energy.index.min()} to {df_energy.index.max()} (total: {len(df_energy)} rows)")
                 

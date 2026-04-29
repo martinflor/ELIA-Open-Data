@@ -1,4 +1,4 @@
-import pandas as pd
+﻿import pandas as pd
 import requests
 from datetime import datetime, timedelta
 import logging
@@ -410,9 +410,9 @@ def analyze_afrr_negative_prices(df):
         - count          : number of periods with a negative price
         - total          : total number of non-null periods
         - pct            : share of negative periods (%)
-        - min_price      : most negative price observed (€/MWh)
-        - max_price      : least negative price among negatives (€/MWh)
-        - mean_price     : average of negative prices (€/MWh)
+        - min_price      : most negative price observed (â‚¬/MWh)
+        - max_price      : least negative price among negatives (â‚¬/MWh)
+        - mean_price     : average of negative prices (â‚¬/MWh)
         - timestamps     : DatetimeIndex of all periods with a negative price
     """
     results = {}
@@ -424,7 +424,7 @@ def analyze_afrr_negative_prices(df):
 
     for direction, col in direction_cols.items():
         if col not in df.columns:
-            logger.warning(f"Column '{col}' not found in DataFrame – skipping '{direction}' direction.")
+            logger.warning(f"Column '{col}' not found in DataFrame â€“ skipping '{direction}' direction.")
             results[direction] = None
             continue
 
@@ -462,7 +462,7 @@ def analyze_afrr_negative_prices(df):
     }
 
     logger.info(
-        f"aFRR negative price analysis – "
+        f"aFRR negative price analysis â€“ "
         f"UP: {results['summary']['negative_up_count']} periods "
         f"({results['summary']['negative_up_pct']}%), "
         f"DOWN: {results['summary']['negative_down_count']} periods "
