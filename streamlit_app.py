@@ -140,6 +140,80 @@ def fetch_capacity_with_progress(start_date: date, end_date: date) -> pd.DataFra
     return pd.concat(frames, axis=0).reset_index(drop=True)
 
 
+def fetch_pv_with_progress(start_date: date, end_date: date) -> pd.DataFrame:
+    """Fetch photovoltaic production data using the chunked fetcher."""
+    progress = st.progress(0, text="Fetching photovoltaic production data...")
+    status = st.empty()
+    
+    status.write(f"⏳ Fetching PV data from {start_date} to {end_date}...")
+    progress.progress(0.5, text="Fetching photovoltaic production data...")
+    
+    try:
+        # Ensure we have latest version if file changed during dev session
+        try:
+            importlib.reload(elia)
+        except Exception:
+            pass
+        
+        # Use chunked fetcher to handle month-by-month internally
+        df = elia.fetch_photovoltaic_production_range_chunked(start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))
+        
+        if df is None or df.empty:
+            status.empty()
+            progress.empty()
+            st.warning("No photovoltaic production data returned.")
+            return pd.DataFrame()
+        
+        status.empty()
+        progress.empty()
+        
+        st.success(f"✅ Fetched {len(df)} rows | {df.index.min()} to {df.index.max()}")
+        return df
+        
+    except Exception as e:
+        status.empty()
+        progress.empty()
+        st.error(f"❌ PV fetch failed: {str(e)}")
+        return pd.DataFrame()
+
+
+def fetch_imbalance_with_progress(start_date: date, end_date: date) -> pd.DataFrame:
+    """Fetch balancing energy prices (imbalance data) using the chunked fetcher."""
+    progress = st.progress(0, text="Fetching imbalance data...")
+    status = st.empty()
+    
+    status.write(f"⏳ Fetching imbalance data from {start_date} to {end_date}...")
+    progress.progress(0.5, text="Fetching imbalance data...")
+    
+    try:
+        # Ensure we have latest version if file changed during dev session
+        try:
+            importlib.reload(elia)
+        except Exception:
+            pass
+        
+        # Use chunked fetcher to handle month-by-month internally
+        df = elia.fetch_balancing_energy_prices_range_chunked(start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))
+        
+        if df is None or df.empty:
+            status.empty()
+            progress.empty()
+            st.warning("No imbalance data returned.")
+            return pd.DataFrame()
+        
+        status.empty()
+        progress.empty()
+        
+        st.success(f"✅ Fetched {len(df)} rows | {df.index.min()} to {df.index.max()}")
+        return df
+        
+    except Exception as e:
+        status.empty()
+        progress.empty()
+        st.error(f"❌ Imbalance fetch failed: {str(e)}")
+        return pd.DataFrame()
+
+
 def build_capacity_periods(df: pd.DataFrame) -> pd.DataFrame:
     """Construct 4-hour period start/end timestamps from deliverydate and capacitybiddeliveryperiod.
 
@@ -292,9 +366,9 @@ def render_aggregations(df: pd.DataFrame):
 
 
 def main():
-    st.set_page_config(page_title="ELIA aFRR Price Explorer", layout="wide")
-    st.title("ELIA aFRR Price Explorer")
-    st.caption("Interactive exploration of aFRR energy and capacity prices from ELIA Open Data.")
+    st.set_page_config(page_title="ELIA Open Data Explorer", layout="wide")
+    st.title("ELIA Open Data Explorer")
+    st.caption("Interactive exploration of aFRR energy and capacity prices, and photovoltaic production from ELIA Open Data.")
 
     # Sidebar controls
     st.sidebar.header("Controls")
@@ -383,7 +457,10 @@ def main():
     st.sidebar.info(f"📅 Selected range:\n{start_date} to {end_date}")
     
     st.sidebar.write("\n")
-    fetch_button = st.sidebar.button("Fetch data", type="primary")
+    st.sidebar.subheader("Fetch Data")
+    fetch_button = st.sidebar.button("Fetch aFRR data", type="primary")
+    fetch_pv_button = st.sidebar.button("Fetch PV data", type="secondary")
+    fetch_imbalance_button = st.sidebar.button("Fetch Imbalance data", type="secondary")
 
     # Check if we're viewing cached data from a different range BEFORE fetching
     cached_range = st.session_state.get("energy_range")
@@ -402,12 +479,26 @@ def main():
         st.session_state["cap_df_raw"] = cap_df_raw
         st.session_state["capacity_range"] = (start_date, end_date)
 
+    if fetch_pv_button:
+        # Fetch PV data with progress
+        df_pv = fetch_pv_with_progress(start_date, end_date)
+        st.session_state["df_pv"] = df_pv
+        st.session_state["pv_range"] = (start_date, end_date)
+
+    if fetch_imbalance_button:
+        # Fetch imbalance data with progress
+        df_imbalance = fetch_imbalance_with_progress(start_date, end_date)
+        st.session_state["df_imbalance"] = df_imbalance
+        st.session_state["imbalance_range"] = (start_date, end_date)
+
     # Load from session AFTER potential fetch
     df_energy = st.session_state.get("df_energy")
     cap_df_raw = st.session_state.get("cap_df_raw")
+    df_pv = st.session_state.get("df_pv")
+    df_imbalance = st.session_state.get("df_imbalance")
 
     # Build tabs always, using session data when present
-    tab1, tab2, tab3 = st.tabs(["aFRR Energy Prices", "aFRR Capacity Prices", "aFRR Capacity Volume"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["aFRR Energy Prices", "aFRR Capacity Prices", "aFRR Capacity Volume", "Photovoltaic Production", "System Imbalance"])
 
     with tab1:
             if df_energy is None or df_energy.empty:
@@ -478,6 +569,172 @@ def main():
                 # Aggregations
                 st.subheader("Aggregations")
                 render_aggregations(df_used)
+
+                # ── Negative Price Analysis ──────────────────────────────────────────
+                st.subheader("Negative Price Analysis")
+                st.caption(
+                    "Periods where the aFRR energy price (UP or DOWN) is strictly negative (< 0 €/MWh)."
+                )
+
+                neg_analysis = elia.analyze_afrr_negative_prices(df_energy)
+                up_r   = neg_analysis.get("up")
+                down_r = neg_analysis.get("down")
+                summary = neg_analysis.get("summary", {})
+
+                # -- Top-level KPI metrics -------------------------------------------
+                kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
+                with kpi1:
+                    st.metric(
+                        "Negative UP periods",
+                        up_r["count"] if up_r else "N/A",
+                        f"{up_r['pct']} %" if up_r else "",
+                    )
+                with kpi2:
+                    st.metric(
+                        "Negative DOWN periods",
+                        down_r["count"] if down_r else "N/A",
+                        f"{down_r['pct']} %" if down_r else "",
+                    )
+                with kpi3:
+                    st.metric(
+                        "Both negative simultaneously",
+                        summary.get("both_negative_count", "N/A"),
+                    )
+                with kpi4:
+                    st.metric(
+                        "Total periods (UP)",
+                        up_r["total"] if up_r else "N/A",
+                    )
+                with kpi5:
+                    st.metric(
+                        "Total periods (DOWN)",
+                        down_r["total"] if down_r else "N/A",
+                    )
+
+                # -- Statistics comparison table -------------------------------------
+                st.write("**Negative-price statistics by direction**")
+                neg_stats_rows = []
+                for label, r in [("UP", up_r), ("DOWN", down_r)]:
+                    if r:
+                        neg_stats_rows.append({
+                            "Direction":  label,
+                            "Count":      r["count"],
+                            "Total":      r["total"],
+                            "Share (%)":  r["pct"],
+                            "Min (€/MWh)":  r["min_price"]  if r["count"] > 0 else None,
+                            "Max (€/MWh)":  r["max_price"]  if r["count"] > 0 else None,
+                            "Mean (€/MWh)": r["mean_price"] if r["count"] > 0 else None,
+                        })
+                if neg_stats_rows:
+                    neg_stats_df = pd.DataFrame(neg_stats_rows).set_index("Direction")
+                    st.dataframe(
+                        neg_stats_df.style.format(
+                            {
+                                "Share (%)":    "{:.2f}",
+                                "Min (€/MWh)":  "{:.2f}",
+                                "Max (€/MWh)":  "{:.2f}",
+                                "Mean (€/MWh)": "{:.2f}",
+                            },
+                            na_rep="—",
+                        ),
+                        use_container_width=True,
+                    )
+
+                # -- Time-series scatter of negative prices --------------------------
+                st.write("**Negative price occurrences over time**")
+                fig_neg = go.Figure()
+                if up_r and up_r["count"] > 0:
+                    neg_up_df = df_energy.loc[up_r["timestamps"], ["afrrpriceup"]]
+                    fig_neg.add_trace(
+                        go.Scatter(
+                            x=neg_up_df.index,
+                            y=neg_up_df["afrrpriceup"],
+                            mode="markers",
+                            name="Negative UP price",
+                            marker=dict(color="#d62728", size=5, symbol="circle"),
+                        )
+                    )
+                if down_r and down_r["count"] > 0:
+                    neg_dn_df = df_energy.loc[down_r["timestamps"], ["afrrpricedown"]]
+                    fig_neg.add_trace(
+                        go.Scatter(
+                            x=neg_dn_df.index,
+                            y=neg_dn_df["afrrpricedown"],
+                            mode="markers",
+                            name="Negative DOWN price",
+                            marker=dict(color="#1f77b4", size=5, symbol="diamond"),
+                        )
+                    )
+                fig_neg.add_hline(
+                    y=0,
+                    line_dash="dash",
+                    line_color="black",
+                    line_width=1,
+                    annotation_text="0 €/MWh",
+                    annotation_position="top left",
+                )
+                fig_neg.update_layout(
+                    title="aFRR energy prices — negative occurrences",
+                    xaxis_title="Datetime",
+                    yaxis_title="Price (€/MWh)",
+                    hovermode="x unified",
+                )
+                if (up_r and up_r["count"] > 0) or (down_r and down_r["count"] > 0):
+                    st.plotly_chart(fig_neg, use_container_width=True)
+                else:
+                    st.info("No negative price periods found in the selected range.")
+
+                # -- Monthly breakdown of negative-price occurrences -----------------
+                st.write("**Monthly negative-price count — UP vs DOWN**")
+                monthly_neg_rows = []
+                feat_neg = add_time_features(df_energy)
+
+                for label, col_name, r in [
+                    ("UP",   "afrrpriceup",   up_r),
+                    ("DOWN", "afrrpricedown", down_r),
+                ]:
+                    if r and r["count"] > 0:
+                        neg_mask_col = feat_neg[col_name] < 0
+                        monthly_cnt = (
+                            feat_neg[neg_mask_col]
+                            .groupby(["year", "month", "month_name"])
+                            .size()
+                            .reset_index(name="neg_count")
+                        )
+                        monthly_cnt["direction"] = label
+                        monthly_cnt["year_month"] = (
+                            monthly_cnt["year"].astype(str)
+                            + "-"
+                            + monthly_cnt["month_name"]
+                        )
+                        monthly_neg_rows.append(monthly_cnt)
+
+                if monthly_neg_rows:
+                    monthly_neg_df = pd.concat(monthly_neg_rows, ignore_index=True)
+                    monthly_neg_df = monthly_neg_df.sort_values(["year", "month"])
+                    fig_mneg = px.bar(
+                        monthly_neg_df,
+                        x="year_month",
+                        y="neg_count",
+                        color="direction",
+                        barmode="group",
+                        color_discrete_map={"UP": "#d62728", "DOWN": "#1f77b4"},
+                        labels={"neg_count": "Negative periods", "year_month": "Month"},
+                        title="Monthly count of negative aFRR energy price periods",
+                    )
+                    fig_mneg.update_layout(xaxis_tickangle=-45)
+                    st.plotly_chart(fig_mneg, use_container_width=True)
+
+                    # Downloadable monthly breakdown
+                    st.download_button(
+                        label="Download monthly negative-price breakdown (CSV)",
+                        data=monthly_neg_df.to_csv(index=False).encode("utf-8"),
+                        file_name=f"afrr_negative_prices_monthly_{start_date}_{end_date}.csv",
+                        mime="text/csv",
+                        key="dl_neg_monthly",
+                    )
+                else:
+                    st.info("No negative price periods to break down by month.")
 
                 # Downloads
                 st.subheader("Downloads")
@@ -586,6 +843,8 @@ def main():
                 ).sort_index()
                 
                 st.dataframe(vw_agg.head(200))
+                if len(vw_agg) > 200:
+                    st.caption(f"Showing first 200 rows of {len(vw_agg)} total rows. Use download button below to get complete dataset.")
                 
                 # Plot volume-weighted prices as step function
                 fig_vw = go.Figure()
@@ -610,6 +869,15 @@ def main():
                     yaxis_title="EUR/MW/h (volume-weighted)"
                 )
                 st.plotly_chart(fig_vw, use_container_width=True)
+                
+                # Download volume-weighted prices
+                st.download_button(
+                    label="Download volume-weighted capacity prices (CSV)",
+                    data=vw_agg.to_csv(index=True).encode('utf-8'),
+                    file_name=f"afrr_volume_weighted_prices_{start_date}_{end_date}.csv",
+                    mime="text/csv",
+                    key="dl_vw_prices"
+                )
 
                 # Download
                 st.download_button(
@@ -662,6 +930,10 @@ def main():
                 rows = []
                 fig_prob = go.Figure()
                 import bisect
+                # Store data for download tables
+                p_accept_data = []  # For "P(accept) vs Bid Price" table
+                bid_x_p_data = []  # For "Bid × P(accept) vs Bid price" table
+                
                 for blk in blocks_to_analyze:
                     cap_block_dir = cap_df[cap_df['period_hour'] == blk]
                     clearing_series = compute_clearing_thresholds(cap_block_dir, price_col)
@@ -675,6 +947,15 @@ def main():
                     # Curve
                     x_vals, y_vals = prob_curve_from_thresholds(thresholds_sorted)
                     fig_prob.add_trace(go.Scatter(x=x_vals, y=y_vals, mode='lines', name=f"{blk:02d}-{(blk+4)%24:02d}", line_shape='hv'))
+                    
+                    # Store data for P(accept) vs Bid Price table
+                    block_label = f"{blk:02d}-{(blk+4)%24:02d}"
+                    for x, y in zip(x_vals, y_vals):
+                        p_accept_data.append({
+                            "block": block_label,
+                            "bid_price_eur_mwh": float(x),
+                            "P_accept": float(y)
+                        })
 
                 if not rows:
                     st.warning("Not enough historical data to estimate acceptance probability for the selection.")
@@ -699,6 +980,16 @@ def main():
                         x_vals, y_vals = prob_curve_from_thresholds(thresholds_sorted)
                         xy_vals = [float(x)*float(y) for x, y in zip(x_vals, y_vals)]
                         fig_val.add_trace(go.Scatter(x=x_vals, y=xy_vals, mode='lines', name=f"{blk:02d}-{(blk+4)%24:02d}", line_shape='hv'))
+                        
+                        # Store data for Bid × P(accept) vs Bid price table
+                        block_label = f"{blk:02d}-{(blk+4)%24:02d}"
+                        for x, xy in zip(x_vals, xy_vals):
+                            bid_x_p_data.append({
+                                "block": block_label,
+                                "bid_price_eur_mwh": float(x),
+                                "bid_x_P_accept_eur_mwh": float(xy)
+                            })
+                        
                         # Best point on curve
                         if xy_vals:
                             idx, best_val = max(enumerate(xy_vals), key=lambda t: t[1])
@@ -717,6 +1008,37 @@ def main():
                         st.subheader("Recommended bid per block (maximizing bid × P(accept))")
                         best_df = pd.DataFrame(best_rows).sort_values("block")
                         st.dataframe(best_df)
+                    
+                    # Download tables for plot data
+                    st.subheader("Download Plot Data")
+                    
+                    if p_accept_data:
+                        p_accept_df = pd.DataFrame(p_accept_data).sort_values(["block", "bid_price_eur_mwh"])
+                        st.write("**P(accept) vs Bid Price Data**")
+                        st.dataframe(p_accept_df.head(100), use_container_width=True)
+                        if len(p_accept_df) > 100:
+                            st.caption(f"Showing first 100 rows of {len(p_accept_df)} total rows")
+                        st.download_button(
+                            label="Download P(accept) vs Bid Price data (CSV)",
+                            data=p_accept_df.to_csv(index=False).encode("utf-8"),
+                            file_name=f"p_accept_vs_bid_price_{direction}_{block_choice}_{start_date}_{end_date}.csv",
+                            mime="text/csv",
+                            key="dl_p_accept"
+                        )
+                    
+                    if bid_x_p_data:
+                        bid_x_p_df = pd.DataFrame(bid_x_p_data).sort_values(["block", "bid_price_eur_mwh"])
+                        st.write("**Bid × P(accept) vs Bid price Data**")
+                        st.dataframe(bid_x_p_df.head(100), use_container_width=True)
+                        if len(bid_x_p_df) > 100:
+                            st.caption(f"Showing first 100 rows of {len(bid_x_p_df)} total rows")
+                        st.download_button(
+                            label="Download Bid × P(accept) vs Bid price data (CSV)",
+                            data=bid_x_p_df.to_csv(index=False).encode("utf-8"),
+                            file_name=f"bid_x_p_accept_vs_bid_price_{direction}_{block_choice}_{start_date}_{end_date}.csv",
+                            mime="text/csv",
+                            key="dl_bid_x_p"
+                        )
 
     with tab3:
         if cap_df_raw is None or cap_df_raw.empty:
@@ -774,6 +1096,715 @@ def main():
                 file_name=f"afrr_capacity_awarded_volumes_{start_date}_{end_date}.csv",
                 mime="text/csv",
             )
+
+    with tab4:
+        if df_pv is None or df_pv.empty:
+            st.warning("No photovoltaic production data found. Click 'Fetch PV data' to load data.")
+        else:
+            st.caption("Data source: Photovoltaic power production estimation and forecast on Belgian grid — ods032.")
+            st.info(f"📅 Data covers: {df_pv.index.min()} to {df_pv.index.max()} (total: {len(df_pv)} rows)")
+            
+            # Region selector
+            st.subheader("Region Selection")
+            available_regions = sorted(df_pv['region'].unique()) if 'region' in df_pv.columns else []
+            if not available_regions:
+                st.warning("No region data available.")
+            else:
+                selected_region = st.selectbox("Select Region", available_regions)
+                
+                # Filter data by selected region
+                df_region = df_pv[df_pv['region'] == selected_region].copy()
+                
+                if df_region.empty:
+                    st.warning(f"No data for region {selected_region}.")
+                else:
+                    # Ensure we have the required columns
+                    required_cols = ['measured', 'monitoredcapacity', 'loadfactor']
+                    missing_cols = [col for col in required_cols if col not in df_region.columns]
+                    if missing_cols:
+                        st.error(f"Missing required columns: {missing_cols}")
+                    else:
+                        st.success(f"Displaying {len(df_region)} rows for {selected_region}")
+                        
+                        # Ensure index is DatetimeIndex (handle tz-aware values)
+                        if not isinstance(df_region.index, pd.DatetimeIndex):
+                            df_region.index = pd.to_datetime(df_region.index, utc=True)
+                        
+                        # Add time features for aggregations
+                        df_region['year'] = df_region.index.year
+                        df_region['month'] = df_region.index.month
+                        df_region['month_name'] = df_region.index.month_name()
+                        df_region['date'] = df_region.index.date
+                        
+                        # Plot 1: Measured values, monitored capacity, and load factor
+                        st.subheader("Production Metrics Over Time")
+                        
+                        # Create separate subplots for better visualization
+                        fig1 = go.Figure()
+                        fig1.add_trace(go.Scatter(
+                            x=df_region.index, 
+                            y=df_region['measured'], 
+                            mode='lines', 
+                            name='Measured Production (MW)',
+                            line=dict(color='#1f77b4')
+                        ))
+                        fig1.add_trace(go.Scatter(
+                            x=df_region.index, 
+                            y=df_region['monitoredcapacity'], 
+                            mode='lines', 
+                            name='Monitored Capacity (MW)',
+                            line=dict(color='#ff7f0e', dash='dash')
+                        ))
+                        fig1.update_layout(
+                            title=f"PV Production and Capacity - {selected_region}",
+                            xaxis_title="Time",
+                            yaxis_title="Power (MW)",
+                            hovermode='x unified'
+                        )
+                        st.plotly_chart(fig1, use_container_width=True)
+                        
+                        # Load factor plot
+                        fig2 = go.Figure()
+                        fig2.add_trace(go.Scatter(
+                            x=df_region.index, 
+                            y=df_region['loadfactor'], 
+                            mode='lines', 
+                            name='Load Factor (%)',
+                            line=dict(color='#2ca02c'),
+                            fill='tozeroy'
+                        ))
+                        fig2.update_layout(
+                            title=f"Load Factor - {selected_region}",
+                            xaxis_title="Time",
+                            yaxis_title="Load Factor (%)",
+                            hovermode='x unified'
+                        )
+                        st.plotly_chart(fig2, use_container_width=True)
+                        
+                        # Plot 2: Energy (trapezoidal approximation)
+                        st.subheader("Cumulative Energy Production")
+                        st.caption("Energy calculated using trapezoidal integration (assumes 15-minute intervals)")
+                        
+                        # Calculate energy using trapezoidal rule
+                        # Energy = ∫ Power dt, with Power in MW and time in hours
+                        # For 15-minute intervals, dt = 0.25 hours
+                        df_region_sorted = df_region.sort_index()
+                        
+                        # Calculate time differences in hours
+                        time_diffs = df_region_sorted.index.to_series().diff().dt.total_seconds() / 3600
+                        # For the first point, assume same interval as the second
+                        time_diffs.iloc[0] = time_diffs.iloc[1] if len(time_diffs) > 1 else 0.25
+                        
+                        # Trapezoidal rule: E_i = (P_i + P_{i-1})/2 * dt_i
+                        power_avg = (df_region_sorted['measured'] + df_region_sorted['measured'].shift(1)) / 2
+                        power_avg.iloc[0] = df_region_sorted['measured'].iloc[0]  # First point
+                        
+                        energy_increments = power_avg * time_diffs
+                        cumulative_energy = energy_increments.cumsum()
+                        
+                        df_region_sorted['cumulative_energy_mwh'] = cumulative_energy
+                        df_region_sorted['energy_increment_mwh'] = energy_increments
+                        
+                        fig3 = go.Figure()
+                        fig3.add_trace(go.Scatter(
+                            x=df_region_sorted.index, 
+                            y=df_region_sorted['cumulative_energy_mwh'], 
+                            mode='lines', 
+                            name='Cumulative Energy (MWh)',
+                            line=dict(color='#d62728'),
+                            fill='tozeroy'
+                        ))
+                        fig3.update_layout(
+                            title=f"Cumulative Energy Production - {selected_region}",
+                            xaxis_title="Time",
+                            yaxis_title="Cumulative Energy (MWh)",
+                            hovermode='x unified'
+                        )
+                        st.plotly_chart(fig3, use_container_width=True)
+                        
+                        # Plot 3: kWh per month per kWp
+                        st.subheader("Monthly Production per kWp")
+                        st.caption("Energy produced per month normalized by monitored capacity (kWh/kWp)")
+                        
+                        # Group by year and month, sum energy increments
+                        monthly_energy = df_region_sorted.groupby(['year', 'month', 'month_name']).agg({
+                            'energy_increment_mwh': 'sum',
+                            'monitoredcapacity': 'mean'  # average capacity for the month
+                        }).reset_index()
+                        
+                        # Convert MWh to kWh and MW to kW
+                        monthly_energy['energy_kwh'] = monthly_energy['energy_increment_mwh'] * 1000
+                        monthly_energy['capacity_kw'] = monthly_energy['monitoredcapacity'] * 1000
+                        
+                        # Calculate kWh per kWp (kWp = kW peak)
+                        monthly_energy['kwh_per_kwp'] = monthly_energy['energy_kwh'] / monthly_energy['capacity_kw']
+                        
+                        # Create year-month label for plotting
+                        monthly_energy['year_month'] = monthly_energy['year'].astype(str) + '-' + monthly_energy['month_name']
+                        
+                        # Sort by year and month
+                        monthly_energy = monthly_energy.sort_values(['year', 'month'])
+                        
+                        fig4 = px.bar(
+                            monthly_energy, 
+                            x='year_month', 
+                            y='kwh_per_kwp',
+                            title=f"Monthly Energy Production per kWp - {selected_region}",
+                            labels={'year_month': 'Month', 'kwh_per_kwp': 'kWh/kWp'},
+                            color='kwh_per_kwp',
+                            color_continuous_scale='Viridis'
+                        )
+                        fig4.update_layout(xaxis_tickangle=-45)
+                        st.plotly_chart(fig4, use_container_width=True)
+                        
+                        # Display monthly statistics table
+                        st.subheader("Monthly Statistics")
+                        display_cols = ['year_month', 'energy_kwh', 'capacity_kw', 'kwh_per_kwp']
+                        st.dataframe(monthly_energy[display_cols].style.format({
+                            'energy_kwh': '{:.2f}',
+                            'capacity_kw': '{:.2f}',
+                            'kwh_per_kwp': '{:.3f}'
+                        }))
+                        
+                        # Downloads
+                        st.subheader("Downloads")
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.download_button(
+                                label="Download raw PV data (CSV)",
+                                data=df_region.to_csv(index=True).encode("utf-8"),
+                                file_name=f"pv_production_{selected_region}_{start_date}_{end_date}.csv",
+                                mime="text/csv",
+                            )
+                        with col2:
+                            st.download_button(
+                                label="Download monthly statistics (CSV)",
+                                data=monthly_energy.to_csv(index=False).encode("utf-8"),
+                                file_name=f"pv_monthly_stats_{selected_region}_{start_date}_{end_date}.csv",
+                                mime="text/csv",
+                            )
+
+    with tab5:
+        if df_imbalance is None or df_imbalance.empty:
+            st.warning("No imbalance data found. Click 'Fetch Imbalance data' to load data.")
+        else:
+            st.caption("Data source: Balancing energy prices from ELIA Open Data — ods134.")
+            st.info(f"📅 Data covers: {df_imbalance.index.min()} to {df_imbalance.index.max()} (total: {len(df_imbalance)} rows)")
+            
+            # Ensure required columns exist
+            required_cols = ['systemimbalance', 'imbalanceprice']
+            missing_cols = [col for col in required_cols if col not in df_imbalance.columns]
+            if missing_cols:
+                st.error(f"Missing required columns: {missing_cols}")
+            else:
+                # Filter out NaN values for plotting
+                df_plot = df_imbalance[required_cols].dropna()
+                
+                if df_plot.empty:
+                    st.warning("No valid data points for plotting (all values are NaN).")
+                else:
+                    st.success(f"Displaying {len(df_plot)} data points")
+                    
+                    # Create scatter plot with quadrant coloring
+                    fig = go.Figure()
+                    
+                    # Add background rectangles for quadrants
+                    # Upper half (positive imbalance price) - light green
+                    fig.add_shape(
+                        type="rect",
+                        x0=-1000, y0=0, x1=1000, y1=2500,
+                        fillcolor="rgba(144, 238, 144, 0.2)",  # light green
+                        layer="below",
+                        line_width=0,
+                    )
+                    # Lower half (negative imbalance price) - light red
+                    fig.add_shape(
+                        type="rect",
+                        x0=-1000, y0=-1000, x1=1000, y1=0,
+                        fillcolor="rgba(255, 182, 193, 0.2)",  # light red
+                        layer="below",
+                        line_width=0,
+                    )
+                    
+                    # Add reference lines
+                    # Vertical line at System Imbalance = 0
+                    fig.add_vline(
+                        x=0,
+                        line_dash="solid",
+                        line_color="darkgrey",
+                        line_width=2,
+                        annotation_text="System Imbalance = 0",
+                        annotation_position="top"
+                    )
+                    # Vertical line at System Imbalance = -100
+                    fig.add_vline(
+                        x=-100,
+                        line_dash="dash",
+                        line_color="darkgrey",
+                        line_width=1,
+                    )
+                    # Vertical line at System Imbalance = 100
+                    fig.add_vline(
+                        x=100,
+                        line_dash="dash",
+                        line_color="darkgrey",
+                        line_width=1,
+                    )
+                    # Horizontal line at Imbalance Price = 0 (x-axis)
+                    fig.add_hline(
+                        y=0,
+                        line_dash="solid",
+                        line_color="darkgrey",
+                        line_width=2,
+                    )
+                    
+                    # Add scatter plot
+                    fig.add_trace(go.Scatter(
+                        x=df_plot['systemimbalance'],
+                        y=df_plot['imbalanceprice'],
+                        mode='markers',
+                        marker=dict(
+                            color='darkgrey',
+                            size=3,
+                            line=dict(color='lightgrey', width=0.5),
+                            opacity=0.6
+                        ),
+                        name='Data points',
+                        hovertemplate='System Imbalance: %{x:.2f} MW<br>Imbalance Price: %{y:.2f} €/MWh<extra></extra>'
+                    ))
+                    
+                    # Update layout
+                    fig.update_layout(
+                        title="Imbalance Price (€/MWh) vs. System Imbalance (MW)",
+                        xaxis_title="System Imbalance (MW)",
+                        yaxis_title="Imbalance Price (€/MWh)",
+                        xaxis=dict(range=[-1000, 1000]),
+                        yaxis=dict(range=[-1000, 2500]),
+                        hovermode='closest',
+                        width=None,
+                        height=600,
+                        showlegend=False
+                    )
+                    
+                    st.plotly_chart(fig, use_container_width=True)
+                    
+                    # Descriptive statistics
+                    st.subheader("Descriptive Statistics")
+                    st.dataframe(df_plot.describe().T)
+                    
+                    # Additional statistics
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Total Data Points", len(df_plot))
+                    with col2:
+                        st.metric("Mean System Imbalance", f"{df_plot['systemimbalance'].mean():.2f} MW")
+                    with col3:
+                        st.metric("Mean Imbalance Price", f"{df_plot['imbalanceprice'].mean():.2f} €/MWh")
+                    
+                    # Quadrant analysis
+                    st.subheader("Quadrant Analysis")
+                    df_plot_copy = df_plot.copy()
+                    df_plot_copy['quadrant'] = 'Other'
+                    df_plot_copy.loc[(df_plot_copy['systemimbalance'] < 0) & (df_plot_copy['imbalanceprice'] > 0), 'quadrant'] = 'Upper-Left (Shortage)'
+                    df_plot_copy.loc[(df_plot_copy['systemimbalance'] > 0) & (df_plot_copy['imbalanceprice'] < 0), 'quadrant'] = 'Lower-Right (Surplus)'
+                    df_plot_copy.loc[(df_plot_copy['systemimbalance'] > 0) & (df_plot_copy['imbalanceprice'] > 0), 'quadrant'] = 'Upper-Right'
+                    df_plot_copy.loc[(df_plot_copy['systemimbalance'] < 0) & (df_plot_copy['imbalanceprice'] < 0), 'quadrant'] = 'Lower-Left'
+                    
+                    quadrant_counts = df_plot_copy['quadrant'].value_counts()
+                    total_count = len(df_plot_copy)
+                    quadrant_df = pd.DataFrame({
+                        'Count': quadrant_counts,
+                        'Percentage': (quadrant_counts / total_count * 100).round(2)
+                    })
+                    st.dataframe(quadrant_df)
+                    
+                    # Alpha statistics for positive imbalance
+                    st.subheader("Alpha Statistics for Positive Imbalance")
+                    if 'alpha' in df_imbalance.columns and 'systemimbalance' in df_imbalance.columns:
+                        # Filter for positive imbalance
+                        positive_imbalance = df_imbalance[df_imbalance['systemimbalance'] > 0].copy()
+                        if 'alpha' in positive_imbalance.columns:
+                            alpha_positive = positive_imbalance['alpha'].dropna()
+                            
+                            if len(alpha_positive) > 0:
+                                st.info(f"Found {len(alpha_positive)} data points with positive imbalance (out of {len(df_imbalance)} total)")
+                                
+                                # Statistics table
+                                alpha_stats = alpha_positive.describe()
+                                st.dataframe(alpha_stats.to_frame(name='Alpha (Positive Imbalance)').T)
+                                
+                                # Additional metrics
+                                col1, col2, col3, col4 = st.columns(4)
+                                with col1:
+                                    st.metric("Count", len(alpha_positive))
+                                with col2:
+                                    st.metric("Mean", f"{alpha_positive.mean():.4f}")
+                                with col3:
+                                    st.metric("Median", f"{alpha_positive.median():.4f}")
+                                with col4:
+                                    st.metric("Std Dev", f"{alpha_positive.std():.4f}")
+                                
+                                # Distribution plot
+                                fig_alpha = go.Figure()
+                                fig_alpha.add_trace(go.Histogram(
+                                    x=alpha_positive,
+                                    nbinsx=50,
+                                    name='Alpha (Positive Imbalance)',
+                                    marker_color='#1f77b4'
+                                ))
+                                fig_alpha.update_layout(
+                                    title="Distribution of Alpha when System Imbalance > 0",
+                                    xaxis_title="Alpha",
+                                    yaxis_title="Frequency",
+                                    showlegend=False
+                                )
+                                st.plotly_chart(fig_alpha, use_container_width=True)
+                            else:
+                                st.warning("No alpha values available for positive imbalance periods.")
+                        else:
+                            st.warning("Alpha column not found in the data.")
+                    else:
+                        st.warning("Required columns (alpha, systemimbalance) not found in the data.")
+                    
+                    # General Alpha and Alpha Prime statistics
+                    st.subheader("Alpha and Alpha Prime Statistics (from ods134)")
+                    if 'alpha' in df_imbalance.columns or 'alpha_prime' in df_imbalance.columns:
+                        alpha_stats_list = []
+                        
+                        if 'alpha' in df_imbalance.columns:
+                            alpha_all = df_imbalance['alpha'].dropna()
+                            if len(alpha_all) > 0:
+                                alpha_stats_list.append({
+                                    'Variable': 'Alpha',
+                                    'Count': len(alpha_all),
+                                    'Mean': alpha_all.mean(),
+                                    'Median': alpha_all.median(),
+                                    'Std Dev': alpha_all.std(),
+                                    'Min': alpha_all.min(),
+                                    'Max': alpha_all.max(),
+                                    'Q25': alpha_all.quantile(0.25),
+                                    'Q75': alpha_all.quantile(0.75)
+                                })
+                        
+                        if 'alpha_prime' in df_imbalance.columns:
+                            alpha_prime_all = df_imbalance['alpha_prime'].dropna()
+                            if len(alpha_prime_all) > 0:
+                                alpha_stats_list.append({
+                                    'Variable': 'Alpha Prime',
+                                    'Count': len(alpha_prime_all),
+                                    'Mean': alpha_prime_all.mean(),
+                                    'Median': alpha_prime_all.median(),
+                                    'Std Dev': alpha_prime_all.std(),
+                                    'Min': alpha_prime_all.min(),
+                                    'Max': alpha_prime_all.max(),
+                                    'Q25': alpha_prime_all.quantile(0.25),
+                                    'Q75': alpha_prime_all.quantile(0.75)
+                                })
+                        
+                        if alpha_stats_list:
+                            stats_df = pd.DataFrame(alpha_stats_list)
+                            st.dataframe(stats_df.style.format({
+                                'Count': '{:.0f}',
+                                'Mean': '{:.6f}',
+                                'Median': '{:.6f}',
+                                'Std Dev': '{:.6f}',
+                                'Min': '{:.6f}',
+                                'Max': '{:.6f}',
+                                'Q25': '{:.6f}',
+                                'Q75': '{:.6f}'
+                            }))
+                            
+                            # Detailed descriptive statistics
+                            st.write("**Detailed Descriptive Statistics**")
+                            alpha_cols = []
+                            if 'alpha' in df_imbalance.columns:
+                                alpha_cols.append('alpha')
+                            if 'alpha_prime' in df_imbalance.columns:
+                                alpha_cols.append('alpha_prime')
+                            
+                            if alpha_cols:
+                                detailed_stats = df_imbalance[alpha_cols].describe().T
+                                st.dataframe(detailed_stats)
+                            
+                            # Distribution plots
+                            if 'alpha' in df_imbalance.columns and 'alpha_prime' in df_imbalance.columns:
+                                st.write("**Distribution Comparison**")
+                                fig_alpha_comp = go.Figure()
+                                
+                                alpha_all = df_imbalance['alpha'].dropna()
+                                alpha_prime_all = df_imbalance['alpha_prime'].dropna()
+                                
+                                if len(alpha_all) > 0:
+                                    fig_alpha_comp.add_trace(go.Histogram(
+                                        x=alpha_all,
+                                        nbinsx=50,
+                                        name='Alpha',
+                                        marker_color='#1f77b4',
+                                        opacity=0.7
+                                    ))
+                                
+                                if len(alpha_prime_all) > 0:
+                                    fig_alpha_comp.add_trace(go.Histogram(
+                                        x=alpha_prime_all,
+                                        nbinsx=50,
+                                        name='Alpha Prime',
+                                        marker_color='#ff7f0e',
+                                        opacity=0.7
+                                    ))
+                                
+                                fig_alpha_comp.update_layout(
+                                    title="Distribution of Alpha and Alpha Prime",
+                                    xaxis_title="Value",
+                                    yaxis_title="Frequency",
+                                    barmode='overlay'
+                                )
+                                st.plotly_chart(fig_alpha_comp, use_container_width=True)
+                            
+                            # Time series plot if both are available
+                            if 'alpha' in df_imbalance.columns and 'alpha_prime' in df_imbalance.columns:
+                                st.write("**Time Series**")
+                                alpha_ts = df_imbalance[['alpha', 'alpha_prime']].dropna()
+                                if not alpha_ts.empty:
+                                    fig_alpha_ts = go.Figure()
+                                    fig_alpha_ts.add_trace(go.Scatter(
+                                        x=alpha_ts.index,
+                                        y=alpha_ts['alpha'],
+                                        mode='lines',
+                                        name='Alpha',
+                                        line=dict(color='#1f77b4')
+                                    ))
+                                    fig_alpha_ts.add_trace(go.Scatter(
+                                        x=alpha_ts.index,
+                                        y=alpha_ts['alpha_prime'],
+                                        mode='lines',
+                                        name='Alpha Prime',
+                                        line=dict(color='#ff7f0e')
+                                    ))
+                                    fig_alpha_ts.update_layout(
+                                        title="Alpha and Alpha Prime Over Time",
+                                        xaxis_title="Time",
+                                        yaxis_title="Value",
+                                        hovermode='x unified'
+                                    )
+                                    st.plotly_chart(fig_alpha_ts, use_container_width=True)
+                        else:
+                            st.warning("No alpha or alpha_prime data available.")
+                    else:
+                        st.warning("Alpha and alpha_prime columns not found in the data.")
+                    
+                    # Marginal Decremental Price Statistics
+                    st.subheader("Marginal Decremental Price Statistics")
+                    if 'marginaldecrementalprice' in df_imbalance.columns:
+                        mdp_all = df_imbalance['marginaldecrementalprice'].dropna()
+                        
+                        if len(mdp_all) > 0:
+                            st.info(f"Found {len(mdp_all)} data points with marginal decremental price (out of {len(df_imbalance)} total)")
+                            
+                            # Statistics table
+                            mdp_stats = mdp_all.describe()
+                            st.dataframe(mdp_stats.to_frame(name='Marginal Decremental Price').T)
+                            
+                            # Additional metrics
+                            col1, col2, col3, col4 = st.columns(4)
+                            with col1:
+                                st.metric("Count", len(mdp_all))
+                            with col2:
+                                st.metric("Mean", f"{mdp_all.mean():.2f} €/MWh")
+                            with col3:
+                                st.metric("Median", f"{mdp_all.median():.2f} €/MWh")
+                            with col4:
+                                st.metric("Std Dev", f"{mdp_all.std():.2f} €/MWh")
+                            
+                            # Count positive vs negative
+                            positive_mdp = (mdp_all > 0).sum()
+                            negative_mdp = (mdp_all < 0).sum()
+                            zero_mdp = (mdp_all == 0).sum()
+                            
+                            st.write("**Sign Analysis**")
+                            sign_col1, sign_col2, sign_col3 = st.columns(3)
+                            with sign_col1:
+                                st.metric("Positive Values", positive_mdp, f"({positive_mdp/len(mdp_all)*100:.1f}%)")
+                            with sign_col2:
+                                st.metric("Negative Values", negative_mdp, f"({negative_mdp/len(mdp_all)*100:.1f}%)")
+                            with sign_col3:
+                                st.metric("Zero Values", zero_mdp, f"({zero_mdp/len(mdp_all)*100:.1f}%)")
+                            
+                            # Distribution plot
+                            fig_mdp = go.Figure()
+                            fig_mdp.add_trace(go.Histogram(
+                                x=mdp_all,
+                                nbinsx=50,
+                                name='Marginal Decremental Price',
+                                marker_color='#2ca02c'
+                            ))
+                            fig_mdp.update_layout(
+                                title="Distribution of Marginal Decremental Price",
+                                xaxis_title="Marginal Decremental Price (€/MWh)",
+                                yaxis_title="Frequency",
+                                showlegend=False
+                            )
+                            st.plotly_chart(fig_mdp, use_container_width=True)
+                            
+                            # Analysis of marginaldecrementalprice - alpha
+                            st.subheader("Analysis: Marginal Decremental Price - Alpha (Positive System Imbalance)")
+                            if 'alpha' in df_imbalance.columns:
+                                # Create a dataframe with required columns, dropping rows where any is NaN
+                                # Include systemimbalance and imbalanceprice to ensure we only analyze valid imbalance periods
+                                required_cols = ['marginaldecrementalprice', 'alpha', 'systemimbalance', 'imbalanceprice']
+                                available_cols = [col for col in required_cols if col in df_imbalance.columns]
+                                analysis_df = df_imbalance[available_cols].dropna()
+
+                                # Restrict to positive system imbalance only
+                                if 'systemimbalance' in analysis_df.columns:
+                                    analysis_df = analysis_df[analysis_df['systemimbalance'] > 0]
+                                
+                                if len(analysis_df) > 0:
+                                    # Calculate the difference
+                                    analysis_df['mdp_minus_alpha'] = analysis_df['marginaldecrementalprice'] - analysis_df['alpha']
+                                    
+                                    # Count cases where mdp - alpha < 0
+                                    negative_diff = (analysis_df['mdp_minus_alpha'] < 0).sum()
+                                    positive_diff = (analysis_df['mdp_minus_alpha'] > 0).sum()
+                                    zero_diff = (analysis_df['mdp_minus_alpha'] == 0).sum()
+                                    
+                                    st.info(f"Analyzing {len(analysis_df)} data points with positive system imbalance where marginaldecrementalprice, alpha, systemimbalance, and imbalanceprice are all available")
+                                    
+                                    # Summary statistics
+                                    st.write("**Difference Statistics (Marginal Decremental Price - Alpha)**")
+                                    diff_stats = analysis_df['mdp_minus_alpha'].describe()
+                                    st.dataframe(diff_stats.to_frame(name='MDP - Alpha').T)
+                                    
+                                    # Count cases where difference is negative
+                                    st.write("**Cases where Marginal Decremental Price - Alpha < 0**")
+                                    diff_col1, diff_col2, diff_col3 = st.columns(3)
+                                    with diff_col1:
+                                        st.metric("Negative Difference", negative_diff, f"({negative_diff/len(analysis_df)*100:.1f}%)")
+                                    with diff_col2:
+                                        st.metric("Positive Difference", positive_diff, f"({positive_diff/len(analysis_df)*100:.1f}%)")
+                                    with diff_col3:
+                                        st.metric("Zero Difference", zero_diff, f"({zero_diff/len(analysis_df)*100:.1f}%)")
+                                    
+                                    # Filter cases where mdp - alpha < 0
+                                    negative_cases = analysis_df[analysis_df['mdp_minus_alpha'] < 0].copy()
+                                    
+                                    if len(negative_cases) > 0:
+                                        st.write(f"**Analysis of {len(negative_cases)} cases where MDP - Alpha < 0**")
+                                        
+                                        # Breakdown by MDP sign and resulting imbalance price
+                                        total_neg_cases = len(negative_cases)
+                                        # Cases where MDP is positive or zero and final imbalance price is negative
+                                        pos_or_zero_mdp_neg_ip = (
+                                            (negative_cases['marginaldecrementalprice'] >= 0) &
+                                            (negative_cases['imbalanceprice'] < 0)
+                                        ).sum()
+                                        # Cases with negative MDP (any final price)
+                                        neg_mdp_cases = (negative_cases['marginaldecrementalprice'] < 0).sum()
+                                        # Cases where final imbalance price is exactly zero
+                                        zero_imbalance_price_cases = (negative_cases['imbalanceprice'] == 0).sum()
+                                        
+                                        st.write(f"**In these {total_neg_cases} cases:**")
+                                        case_col1, case_col2, case_col3 = st.columns(3)
+                                        with case_col1:
+                                            st.metric(
+                                                "Positive or Zero MDP → Negative Imbalance Price",
+                                                pos_or_zero_mdp_neg_ip,
+                                                f"({pos_or_zero_mdp_neg_ip/total_neg_cases*100:.1f}%)"
+                                            )
+                                        with case_col2:
+                                            st.metric(
+                                                "Cases with Negative MDP (any price)",
+                                                neg_mdp_cases,
+                                                f"({neg_mdp_cases/total_neg_cases*100:.1f}%)"
+                                            )
+                                        with case_col3:
+                                            st.metric(
+                                                "Imbalance Price = 0",
+                                                zero_imbalance_price_cases,
+                                                f"({zero_imbalance_price_cases/total_neg_cases*100:.1f}%)"
+                                            )
+                                        
+                                        # Statistics for these cases
+                                        st.write("**Statistics for cases where MDP - Alpha < 0:**")
+                                        negative_cases_stats = negative_cases[['marginaldecrementalprice', 'alpha', 'mdp_minus_alpha']].describe().T
+                                        st.dataframe(negative_cases_stats)
+                                        
+                                        # Scatter plot: MDP vs Alpha for negative difference cases
+                                        fig_neg_diff = go.Figure()
+                                        fig_neg_diff.add_trace(go.Scatter(
+                                            x=negative_cases['alpha'],
+                                            y=negative_cases['marginaldecrementalprice'],
+                                            mode='markers',
+                                            marker=dict(
+                                                color=negative_cases['mdp_minus_alpha'],
+                                                colorscale='RdBu',
+                                                size=5,
+                                                showscale=True,
+                                                colorbar=dict(title="MDP - Alpha")
+                                            ),
+                                            name='MDP - Alpha < 0',
+                                            hovertemplate='Alpha: %{x:.2f}<br>MDP: %{y:.2f} €/MWh<br>Difference: %{marker.color:.2f}<extra></extra>'
+                                        ))
+                                        # Add line where MDP = Alpha (diagonal)
+                                        if len(negative_cases) > 0:
+                                            min_val = min(negative_cases['alpha'].min(), negative_cases['marginaldecrementalprice'].min())
+                                            max_val = max(negative_cases['alpha'].max(), negative_cases['marginaldecrementalprice'].max())
+                                            fig_neg_diff.add_trace(go.Scatter(
+                                                x=[min_val, max_val],
+                                                y=[min_val, max_val],
+                                                mode='lines',
+                                                name='MDP = Alpha (diagonal)',
+                                                line=dict(color='red', dash='dash', width=2)
+                                            ))
+                                        fig_neg_diff.update_layout(
+                                            title="Marginal Decremental Price vs Alpha (cases where MDP - Alpha < 0)",
+                                            xaxis_title="Alpha",
+                                            yaxis_title="Marginal Decremental Price (€/MWh)",
+                                            hovermode='closest'
+                                        )
+                                        st.plotly_chart(fig_neg_diff, use_container_width=True)
+                                        
+                                        # Distribution of the difference
+                                        fig_diff_dist = go.Figure()
+                                        fig_diff_dist.add_trace(go.Histogram(
+                                            x=analysis_df['mdp_minus_alpha'],
+                                            nbinsx=50,
+                                            name='MDP - Alpha',
+                                            marker_color='#d62728'
+                                        ))
+                                        fig_diff_dist.add_vline(
+                                            x=0,
+                                            line_dash="dash",
+                                            line_color="black",
+                                            line_width=2,
+                                            annotation_text="Zero line"
+                                        )
+                                        fig_diff_dist.update_layout(
+                                            title="Distribution of (Marginal Decremental Price - Alpha)",
+                                            xaxis_title="MDP - Alpha (€/MWh)",
+                                            yaxis_title="Frequency",
+                                            showlegend=False
+                                        )
+                                        st.plotly_chart(fig_diff_dist, use_container_width=True)
+                                    else:
+                                        st.info("No cases found where Marginal Decremental Price - Alpha < 0")
+                                else:
+                                    st.warning("No data points available where both marginaldecrementalprice and alpha are present.")
+                            else:
+                                st.warning("Alpha column not found. Cannot perform MDP - Alpha analysis.")
+                        else:
+                            st.warning("No marginal decremental price data available.")
+                    else:
+                        st.warning("Marginal decremental price column not found in the data.")
+                    
+                    # Download
+                    st.subheader("Downloads")
+                    st.download_button(
+                        label="Download imbalance data (CSV)",
+                        data=df_imbalance.to_csv(index=True).encode("utf-8"),
+                        file_name=f"imbalance_data_{start_date}_{end_date}.csv",
+                        mime="text/csv",
+                    )
+
 if __name__ == "__main__":
     main()
 

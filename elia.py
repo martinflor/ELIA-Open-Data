@@ -193,6 +193,59 @@ def fetch_balancing_energy_prices(date):
     )
     return filter_data(data, index_column='datetime')
 
+def fetch_balancing_energy_prices_range(start_date, end_date):
+    """Fetch balancing energy prices for a date range [start_date, end_date] inclusive.
+    
+    Returns a pandas DataFrame indexed by datetime with columns including 'systemimbalance' and 'imbalanceprice'.
+    """
+    try:
+        data = fetch_range_data(
+            dataset='ods134',
+            start_date=start_date,
+            end_date=end_date,
+            select_fields='datetime,ace,systemimbalance,alpha,alpha_prime,marginalincrementalprice,marginaldecrementalprice,imbalanceprice',
+            time_field='datetime'
+        )
+        df = filter_data(data, index_column='datetime')
+        if not df.empty:
+            df = df.sort_index()
+            df = df[~df.index.duplicated(keep='last')]
+        return df
+    except Exception as e:
+        logger.error(f"Failed to fetch balancing energy prices for range {start_date} to {end_date}: {str(e)}")
+        raise
+
+def fetch_balancing_energy_prices_range_chunked(start_date, end_date):
+    """Fetch balancing energy prices by iterating month-sized chunks to avoid API result size/offset limits.
+    
+    Splits [start_date, end_date] into calendar months and merges results.
+    """
+    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+    
+    frames = []
+    cursor = _month_start(start_dt)
+    final_end = end_dt
+    
+    while cursor <= final_end:
+        chunk_start = max(cursor, start_dt)
+        chunk_end = min(_next_month(cursor) - timedelta(days=1), final_end)
+        try:
+            df_chunk = fetch_balancing_energy_prices_range(chunk_start.strftime('%Y-%m-%d'), chunk_end.strftime('%Y-%m-%d'))
+            if not df_chunk.empty:
+                frames.append(df_chunk)
+        except Exception as e:
+            logger.error(f"Balancing energy chunk fetch failed for {chunk_start.date()} to {chunk_end.date()}: {e}")
+        cursor = _next_month(cursor)
+    
+    if not frames:
+        return pd.DataFrame()
+    
+    df = pd.concat(frames, axis=0)
+    df = df[~df.index.duplicated(keep='last')]
+    df = df.sort_index()
+    return df
+
 def fetch_afrr_energy_price(date):
     logger.info(f"Starting fetch_afrr_energy_price for {date}")
     try:
@@ -342,6 +395,84 @@ def fetch_afrr_energy_price_range_chunked(start_date, end_date):
     df = df.sort_index()
     return df
 
+def analyze_afrr_negative_prices(df):
+    """Analyse negative aFRR energy prices for both UP and DOWN directions.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        DataFrame returned by fetch_afrr_energy_price* functions.
+        Must contain columns 'afrrpriceup' and/or 'afrrpricedown'.
+
+    Returns
+    -------
+    dict with keys 'up', 'down', and 'summary', each containing:
+        - count          : number of periods with a negative price
+        - total          : total number of non-null periods
+        - pct            : share of negative periods (%)
+        - min_price      : most negative price observed (€/MWh)
+        - max_price      : least negative price among negatives (€/MWh)
+        - mean_price     : average of negative prices (€/MWh)
+        - timestamps     : DatetimeIndex of all periods with a negative price
+    """
+    results = {}
+
+    direction_cols = {
+        'up':   'afrrpriceup',
+        'down': 'afrrpricedown',
+    }
+
+    for direction, col in direction_cols.items():
+        if col not in df.columns:
+            logger.warning(f"Column '{col}' not found in DataFrame – skipping '{direction}' direction.")
+            results[direction] = None
+            continue
+
+        series = pd.to_numeric(df[col], errors='coerce')
+        total = series.notna().sum()
+        neg_mask = series < 0
+        neg_series = series[neg_mask]
+
+        results[direction] = {
+            'count':      int(neg_mask.sum()),
+            'total':      int(total),
+            'pct':        round(neg_mask.sum() / total * 100, 2) if total > 0 else 0.0,
+            'min_price':  round(float(neg_series.min()), 4) if not neg_series.empty else None,
+            'max_price':  round(float(neg_series.max()), 4) if not neg_series.empty else None,
+            'mean_price': round(float(neg_series.mean()), 4) if not neg_series.empty else None,
+            'timestamps': neg_series.index,
+        }
+
+    # Cross-direction summary
+    up_r   = results.get('up')
+    down_r = results.get('down')
+
+    both_negative_count = 0
+    if up_r is not None and down_r is not None:
+        up_neg_idx   = set(up_r['timestamps'].tolist())   if up_r['timestamps']   is not None else set()
+        down_neg_idx = set(down_r['timestamps'].tolist()) if down_r['timestamps'] is not None else set()
+        both_negative_count = len(up_neg_idx & down_neg_idx)
+
+    results['summary'] = {
+        'negative_up_count':         up_r['count']   if up_r   else None,
+        'negative_down_count':       down_r['count'] if down_r else None,
+        'both_negative_count':       both_negative_count,
+        'negative_up_pct':           up_r['pct']     if up_r   else None,
+        'negative_down_pct':         down_r['pct']   if down_r else None,
+    }
+
+    logger.info(
+        f"aFRR negative price analysis – "
+        f"UP: {results['summary']['negative_up_count']} periods "
+        f"({results['summary']['negative_up_pct']}%), "
+        f"DOWN: {results['summary']['negative_down_count']} periods "
+        f"({results['summary']['negative_down_pct']}%), "
+        f"both negative simultaneously: {both_negative_count}"
+    )
+
+    return results
+
+
 def fetch_afrr_capacity(date):
     data = fetch_day_data(
         dataset='ods125',
@@ -367,6 +498,39 @@ def fetch_afrr_capacity_range(start_date, end_date):
     )
     return filter_data(data, index_column=None)
 
+def fetch_afrr_capacity_range_all(start_date, end_date):
+    """Fetch all aFRR capacity bids (accepted + rejected) for a date range."""
+    data = fetch_range_data(
+        dataset='ods125',
+        start_date=start_date,
+        end_date=end_date,
+        select_fields='deliverydate,capacitybiddeliveryperiod,selectedbyoptimizer,afrrofferedvolumeupmw,afrrawardedvolumeupmw,priceupmwh,afrrofferedvolumedownmw,afrrawardedvolumedownmw,pricedownmwh,selectedvolumeupafterstep2,selectedvolumedownafterstep2',
+        time_field='deliverydate'
+    )
+    return filter_data(data, index_column=None)
+
+def fetch_afrr_capacity_range_all_chunked(start_date, end_date):
+    """Month-chunked fetch for all aFRR capacity bids (accepted + rejected)."""
+    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+    frames = []
+    cursor = _month_start(start_dt)
+    final_end = end_dt
+    while cursor <= final_end:
+        chunk_start = max(cursor, start_dt)
+        chunk_end = min(_next_month(cursor) - timedelta(days=1), final_end)
+        try:
+            df_chunk = fetch_afrr_capacity_range_all(chunk_start.strftime('%Y-%m-%d'), chunk_end.strftime('%Y-%m-%d'))
+            if df_chunk is not None and not df_chunk.empty:
+                frames.append(df_chunk)
+        except Exception as e:
+            logger.error(f"Capacity (all bids) chunk fetch failed for {chunk_start.date()} to {chunk_end.date()}: {e}")
+        cursor = _next_month(cursor)
+    if not frames:
+        return pd.DataFrame()
+    df = pd.concat(frames, axis=0)
+    return df.reset_index(drop=True)
+
 def fetch_afrr_capacity_range_chunked(start_date, end_date):
     """Month-chunked fetch for aFRR capacity range to avoid API limits."""
     start_dt = datetime.strptime(start_date, "%Y-%m-%d")
@@ -388,4 +552,70 @@ def fetch_afrr_capacity_range_chunked(start_date, end_date):
         return pd.DataFrame()
     df = pd.concat(frames, axis=0)
     return df.reset_index(drop=True)
+
+def fetch_photovoltaic_production(date):
+    """Fetch photovoltaic power production data for a single day from ELIA dataset ods032.
+    
+    Returns DataFrame with datetime index and columns: region, measured, monitoredcapacity, loadfactor
+    """
+    try:
+        data = fetch_day_data(
+            dataset='ods032',
+            date=date,
+            select_fields='datetime,resolutioncode,region,measured,monitoredcapacity,loadfactor',
+            time_field='datetime'
+        )
+        return filter_data(data, index_column='datetime')
+    except Exception as e:
+        logger.error(f"Error fetching photovoltaic production for {date}: {str(e)}")
+        return pd.DataFrame()
+
+def fetch_photovoltaic_production_range(start_date, end_date):
+    """Fetch photovoltaic power production data for a date range from ELIA dataset ods032.
+    
+    Returns DataFrame with datetime index and columns: region, measured, monitoredcapacity, loadfactor
+    """
+    try:
+        data = fetch_range_data(
+            dataset='ods032',
+            start_date=start_date,
+            end_date=end_date,
+            select_fields='datetime,resolutioncode,region,measured,monitoredcapacity,loadfactor',
+            time_field='datetime'
+        )
+        return filter_data(data, index_column='datetime')
+    except Exception as e:
+        logger.error(f"Error fetching photovoltaic production for range {start_date} to {end_date}: {str(e)}")
+        return pd.DataFrame()
+
+def fetch_photovoltaic_production_range_chunked(start_date, end_date):
+    """Fetch photovoltaic production by iterating month-sized chunks to avoid API result size/offset limits.
+    
+    Splits [start_date, end_date] into calendar months and merges results.
+    """
+    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+
+    frames = []
+    cursor = _month_start(start_dt)
+    final_end = end_dt
+
+    while cursor <= final_end:
+        chunk_start = max(cursor, start_dt)
+        chunk_end = min(_next_month(cursor) - timedelta(days=1), final_end)
+        try:
+            df_chunk = fetch_photovoltaic_production_range(chunk_start.strftime('%Y-%m-%d'), chunk_end.strftime('%Y-%m-%d'))
+            if not df_chunk.empty:
+                frames.append(df_chunk)
+        except Exception as e:
+            logger.error(f"PV chunk fetch failed for {chunk_start.date()} to {chunk_end.date()}: {e}")
+        cursor = _next_month(cursor)
+
+    if not frames:
+        return pd.DataFrame()
+
+    df = pd.concat(frames, axis=0)
+    df = df[~df.index.duplicated(keep='last')]
+    df = df.sort_index()
+    return df
 
