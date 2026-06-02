@@ -152,7 +152,50 @@ def filter_data(data, index_column=None):
         df[col] = df[col].where(df[col].notna(), None)
     
     if index_column and index_column in df.columns:
-        df[index_column] = pd.to_datetime(df[index_column])
+        df[index_column] = pd.to_datetime(df[index_column], utc=True)
+        df.set_index(index_column, inplace=True)
+    return df
+
+# ods125 schema changed from camelCase to snake_case (2025+). Map API fields back to legacy names.
+AFRR_CAPACITY_LEGACY_RENAME = {
+    'delivery_date': 'deliverydate',
+    'selected_by_optimizer': 'selectedbyoptimizer',
+    'afrr_offered_volume_up': 'afrrofferedvolumeupmw',
+    'afrr_awarded_volume_up': 'afrrawardedvolumeupmw',
+    'price_up': 'priceupmwh',
+    'afrr_offered_volume_down': 'afrrofferedvolumedownmw',
+    'afrr_awarded_volume_down': 'afrrawardedvolumedownmw',
+    'price_down': 'pricedownmwh',
+    'selected_volume_up_step_2': 'selectedvolumeupafterstep2',
+    'selected_volume_down_step_2': 'selectedvolumedownafterstep2',
+}
+
+AFRR_CAPACITY_SELECT = (
+    'delivery_date,delivery_period,capacitybiddeliveryperiod,selected_by_optimizer,'
+    'afrr_offered_volume_up,afrr_awarded_volume_up,price_up,'
+    'afrr_offered_volume_down,afrr_awarded_volume_down,price_down,'
+    'selected_volume_up_step_2,selected_volume_down_step_2'
+)
+
+def _normalize_afrr_capacity_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize ods125 API columns to legacy names used by the app."""
+    if df.empty:
+        return df
+    df = df.copy()
+    if 'delivery_period' in df.columns:
+        if 'capacitybiddeliveryperiod' not in df.columns:
+            df['capacitybiddeliveryperiod'] = df['delivery_period']
+        else:
+            df['capacitybiddeliveryperiod'] = df['capacitybiddeliveryperiod'].fillna(df['delivery_period'])
+        df.drop(columns=['delivery_period'], inplace=True)
+    rename = {k: v for k, v in AFRR_CAPACITY_LEGACY_RENAME.items() if k in df.columns}
+    return df.rename(columns=rename)
+
+def _filter_afrr_capacity_data(data, index_column=None):
+    df = filter_data(data, index_column=None)
+    df = _normalize_afrr_capacity_df(df)
+    if index_column and index_column in df.columns:
+        df[index_column] = pd.to_datetime(df[index_column], utc=True)
         df.set_index(index_column, inplace=True)
     return df
 
@@ -477,11 +520,11 @@ def fetch_afrr_capacity(date):
     data = fetch_day_data(
         dataset='ods125',
         date=date,
-        select_fields='deliverydate,capacitybiddeliveryperiod,selectedbyoptimizer,afrrofferedvolumeupmw,priceupmwh,afrrofferedvolumedownmw,pricedownmwh',
-        time_field='deliverydate',
-        refine_filters={'selectedbyoptimizer': 'True'}
+        select_fields=AFRR_CAPACITY_SELECT,
+        time_field='delivery_date',
+        refine_filters={'selected_by_optimizer': 'True'}
     )
-    return filter_data(data, index_column='deliverydate')
+    return _filter_afrr_capacity_data(data, index_column='deliverydate')
 
 def fetch_afrr_capacity_range(start_date, end_date):
     """Fetch aFRR capacity bids accepted by optimizer for a date range.
@@ -492,11 +535,11 @@ def fetch_afrr_capacity_range(start_date, end_date):
         dataset='ods125',
         start_date=start_date,
         end_date=end_date,
-        select_fields='deliverydate,capacitybiddeliveryperiod,selectedbyoptimizer,afrrofferedvolumeupmw,afrrawardedvolumeupmw,priceupmwh,afrrofferedvolumedownmw,afrrawardedvolumedownmw,pricedownmwh,selectedvolumeupafterstep2,selectedvolumedownafterstep2',
-        time_field='deliverydate',
-        refine_filters={'selectedbyoptimizer': 'True'}
+        select_fields=AFRR_CAPACITY_SELECT,
+        time_field='delivery_date',
+        refine_filters={'selected_by_optimizer': 'True'}
     )
-    return filter_data(data, index_column=None)
+    return _filter_afrr_capacity_data(data, index_column=None)
 
 def fetch_afrr_capacity_range_all(start_date, end_date):
     """Fetch all aFRR capacity bids (accepted + rejected) for a date range."""
@@ -504,10 +547,10 @@ def fetch_afrr_capacity_range_all(start_date, end_date):
         dataset='ods125',
         start_date=start_date,
         end_date=end_date,
-        select_fields='deliverydate,capacitybiddeliveryperiod,selectedbyoptimizer,afrrofferedvolumeupmw,afrrawardedvolumeupmw,priceupmwh,afrrofferedvolumedownmw,afrrawardedvolumedownmw,pricedownmwh,selectedvolumeupafterstep2,selectedvolumedownafterstep2',
-        time_field='deliverydate'
+        select_fields=AFRR_CAPACITY_SELECT,
+        time_field='delivery_date'
     )
-    return filter_data(data, index_column=None)
+    return _filter_afrr_capacity_data(data, index_column=None)
 
 def fetch_afrr_capacity_range_all_chunked(start_date, end_date):
     """Month-chunked fetch for all aFRR capacity bids (accepted + rejected)."""
