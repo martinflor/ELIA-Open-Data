@@ -285,7 +285,7 @@ def render_step_series_with_outliers(
         mode = "Together"
 
     if mode == "Exclude outliers":
-        ts = df_normal[["afrrpriceup", "afrrpricedown"]].resample("15T").mean()
+        ts = df_normal[["afrrpriceup", "afrrpricedown"]].resample("15min").mean()
         if ts.empty:
             st.info("No data to plot.")
             return
@@ -308,7 +308,7 @@ def render_step_series_with_outliers(
         return
 
     # Together: step line for normal, markers for outliers
-    ts = df_normal[["afrrpriceup", "afrrpricedown"]].resample("15T").mean()
+    ts = df_normal[["afrrpriceup", "afrrpricedown"]].resample("15min").mean()
     fig = go.Figure()
     if not ts.empty:
         fig.add_trace(go.Scatter(x=ts.index, y=ts["afrrpriceup"], mode="lines", name="aFRR up (15m)", line_shape="hv"))
@@ -613,7 +613,7 @@ def main():
                 # Time series
                 st.subheader("Time Series (15-minute aFRR energy price)")
                 render_step_series_with_outliers(df_normal=df_normal, df_outliers=df_outliers, mode=outlier_view, title="aFRR energy prices (15-minute)")
-                ts = df_normal[["afrrpriceup", "afrrpricedown"]].resample("15T").mean()
+                ts = df_normal[["afrrpriceup", "afrrpricedown"]].resample("15min").mean()
 
                 # Distributions
                 st.subheader("Distributions")
@@ -953,7 +953,7 @@ def main():
                     if df_block.empty or price_col not in df_block.columns:
                         return pd.Series(dtype="float64")
                     df_block = df_block.copy()
-                    df_block['block_start'] = df_block.index.floor('4H')
+                    df_block['block_start'] = df_block.index.floor('4h')
                     return df_block.groupby('block_start')[price_col].max().dropna().sort_index()
 
                 # Inputs
